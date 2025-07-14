@@ -23,6 +23,7 @@ class PyObjectId(ObjectId):
 
 
 class UserRole(str, Enum):
+    super_admin = "super_admin"
     admin = "admin"
     user = "user"
     viewer = "viewer"

@@ -229,7 +229,7 @@ async def get_users(
     users_collection = await get_users_collection()
     
     # Build search query
-    query = {"is_active": True}  # Only show active users
+    query = {"is_active": True, "_id": {"$ne": ObjectId(current_user.id)}}  # Exclude current user
     
     if search:
         # Case-insensitive search in full_name and email

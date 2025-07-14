@@ -10,7 +10,7 @@ from app.models.folder import (
     RevokeFolderAccessResponse, FolderStatsResponse, FolderStatsFileType,
     PaginatedFoldersResponse, FolderStatus, ConversionMode
 )
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.models.file import FileType
 from app.dependencies import get_current_user, folder_read_access, folder_write_access, folder_admin_access, verify_folder_access
 from app.database import (
@@ -329,12 +329,20 @@ async def get_root_folders(
         shared_folder_ids = [record["folder_id"] for record in shared_access_records]
         
         # Build query for root folders (owned OR shared)
-        folder_query = {
-            "$or": [
-                {"owner_id": current_user.id},  # Owned folders
-                {"_id": {"$in": [ObjectId(fid) for fid in shared_folder_ids]}}  # Shared folders
-            ]
-        }
+        if current_user.user_role == UserRole.super_admin:
+            folder_query = {
+                "$or": [
+                    {"parent_folder_id": None},
+                    {"_id": {"$in": [ObjectId(fid) for fid in shared_folder_ids]}}  # Shared folders
+                ]
+            }
+        else:
+            folder_query = {
+                "$or": [
+                    {"owner_id": current_user.id},  # Owned folders
+                    {"_id": {"$in": [ObjectId(fid) for fid in shared_folder_ids]}}  # Shared folders
+                ]
+            }
         
         if only_true_roots:
             # Add parent folder constraint
@@ -457,8 +465,12 @@ async def get_root_folders(
 @router.get("/{folder_id}", response_model=FolderWithAccess)
 async def get_folder(
     folder_id: str,
-    user_id: str = Depends(folder_read_access)
+    user_id: str = Depends(folder_read_access),
+    current_user: User = Depends(get_current_user)
 ):
+    # If super_admin, skip access validation
+    if current_user.user_role == UserRole.super_admin:
+        user_id = None
     """Get a specific folder with dynamic status calculation"""
     try:
         folders_collection = await get_folders_collection()

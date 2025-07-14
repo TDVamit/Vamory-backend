@@ -12,7 +12,7 @@ from app.models.file import (
     FileThumbnailResponse, FileDeleteResponse, PaginatedFilesResponse
 )
 from app.models.folder import StorageType as FolderStorageType, AccessLevel
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.dependencies import get_current_user, get_current_user_id, folder_read_access, folder_write_access, verify_folder_access
 from app.database import get_files_collection, get_folders_collection
 from app.services.s3 import s3_service
@@ -467,10 +467,14 @@ async def get_files_in_folder(
     storage_type: Optional[str] = Query(None, description="Filter by storage type: STANDARD, STANDARD_IA, GLACIER_IR, DEEP_ARCHIVE"),
     min_size: Optional[int] = Query(None, description="Minimum file size in bytes"),
     max_size: Optional[int] = Query(None, description="Maximum file size in bytes"),
-    user_id: str = Depends(folder_read_access)
+    user_id: str = Depends(folder_read_access),
+    current_user: User = Depends(get_current_user)
 ):
     """Get files in a folder with comprehensive search, filtering, pagination, and sorting"""
     files_collection = await get_files_collection()
+    # If super_admin, skip owner/access validation
+    if current_user.user_role == UserRole.super_admin:
+        user_id = None
     
     # Build query
     query = {"folder_id": folder_id}
@@ -566,7 +570,8 @@ async def get_files_in_folder(
 @router.get("/{file_id}", response_model=File)
 async def get_file(
     file_id: str,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user)
 ):
     """Get a specific file"""
     files_collection = await get_files_collection()
@@ -578,8 +583,9 @@ async def get_file(
             detail="File not found"
         )
     
-    # Check access to the folder containing this file
-    await verify_folder_access(file_doc["folder_id"], user_id, AccessLevel.READ)
+    # If not super_admin, check access
+    if not (hasattr(current_user, 'user_role') and str(current_user.user_role) == 'super_admin'):
+        await verify_folder_access(file_doc["folder_id"], user_id, AccessLevel.READ)
     
     file_doc["_id"] = str(file_doc["_id"])
     
