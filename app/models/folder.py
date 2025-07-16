@@ -38,6 +38,7 @@ class FolderStatus(str, Enum):
     ACTIVE = "active"              # Folder is accessible (Standard IA, Glacier IR)
     INACTIVE = "inactive"          # Folder is in Deep Archive (not immediately accessible)
     CONVERTING = "converting"      # Folder is being converted between storage types
+    COPYING = "copying"            # Folder is being copied/imported
 
 
 class ConversionMode(str, Enum):

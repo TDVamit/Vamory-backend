@@ -477,7 +477,6 @@ async def get_folder(
         
         # Get folder
         folder = await folders_collection.find_one({"_id": ObjectId(folder_id)})
-        
         if not folder:
             raise HTTPException(status_code=404, detail="Folder not found")
         
@@ -746,22 +745,25 @@ async def delete_folder(
             "folder_id": {"$in": folder_ids_to_delete}
         }).to_list(None)
         
-        # Delete files from S3
-        if files_to_delete:
-            s3_keys_to_delete = []
-            
-            for file_doc in files_to_delete:
-                # Add main file S3 key
-                if file_doc.get("s3_key"):
-                    s3_keys_to_delete.append(file_doc["s3_key"])
-                
-                # Add thumbnail S3 key if exists
-                if file_doc.get("thumbnail_s3_key"):
-                    s3_keys_to_delete.append(file_doc["thumbnail_s3_key"])
-            
-            if s3_keys_to_delete:
-                delete_result = await s3_service.delete_files_batch(s3_keys_to_delete)
-                logger.info(f"Deleted {delete_result.get('deleted', 0)} files from S3 for folder {folder_id}")
+        # Delete files from S3 (only if not referenced elsewhere)
+        s3_keys_to_delete = set()
+        for file_doc in files_to_delete:
+            # Main file S3 key
+            s3_key = file_doc.get("s3_key")
+            if s3_key:
+                count = await files_collection.count_documents({"s3_key": s3_key})
+                if count == 1:
+                    s3_keys_to_delete.add(s3_key)
+            # Thumbnail S3 key
+            thumbnail_s3_key = file_doc.get("thumbnail_s3_key")
+            if thumbnail_s3_key:
+                count = await files_collection.count_documents({"thumbnail_s3_key": thumbnail_s3_key})
+                if count == 1:
+                    s3_keys_to_delete.add(thumbnail_s3_key)
+        
+        if s3_keys_to_delete:
+            delete_result = await s3_service.delete_files_batch(list(s3_keys_to_delete))
+            logger.info(f"Deleted {delete_result.get('deleted', 0)} files from S3 for folder {folder_id}")
         
         # Delete files from database
         files_delete_result = await files_collection.delete_many({

@@ -21,6 +21,8 @@ dependencies = [
     "bcrypt==4.0.1",
     "passlib==1.7.4",
     "ffmpeg-python>=0.2.0",
+    "requests>=2.32.4",
+    "aiohttp>=3.12.14",
 ]
 
 [tool.ruff]

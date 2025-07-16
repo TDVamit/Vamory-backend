@@ -11,18 +11,20 @@ from app.models.file import (
     FileType, FileMetadata, StorageType, FileDownloadResponse, 
     FileThumbnailResponse, FileDeleteResponse, PaginatedFilesResponse
 )
-from app.models.folder import StorageType as FolderStorageType, AccessLevel
+from app.models.folder import StorageType as FolderStorageType, AccessLevel, StorageType, FolderStatus
 from app.models.user import User, UserRole
 from app.dependencies import get_current_user, get_current_user_id, folder_read_access, folder_write_access, verify_folder_access
 from app.database import get_files_collection, get_folders_collection
 from app.services.s3 import s3_service
 from app.services.thumbnail import thumbnail_service
 from app.config import settings
-from app.utils import format_file_size, calculate_pagination_metadata, calculate_skip_from_page
+from app.utils import format_file_size, calculate_pagination_metadata, calculate_skip_from_page, calculate_file_hash, should_generate_thumbnail, determine_file_type
 from pydantic import BaseModel
 from botocore.exceptions import ClientError
 import asyncio
 from app.routers.auth import deny_if_viewer
+from app.services.gdrive_utility import is_drive_public
+from app.services.gdrive_download import process_gdrive_import
 
 router = APIRouter(prefix="/files", tags=["Files"])
 
@@ -51,16 +53,6 @@ def should_generate_thumbnail(storage_type: StorageType, file_type: FileType) ->
         return False
     
     return True
-
-
-def calculate_file_hash(file_content: bytes, filename: str, content_type: str, file_size: int) -> str:
-    if file_size > 20000:
-        first_10k = file_content[:10000]
-        last_10k = file_content[-10000:]
-        hash_input = content_type.encode() + str(file_size).encode() + first_10k + last_10k
-    else:
-        hash_input = content_type.encode() + str(file_size).encode() + file_content
-    return hashlib.sha256(hash_input).hexdigest()
 
 
 class PresignUploadRequest(BaseModel):
@@ -216,7 +208,7 @@ async def upload_file(
                     user_id, folder_id, f"thumb_{file.filename}", "thumbnail"
                 )
                 await s3_service.upload_file(
-                    thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD
+                    thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD_IA
                 )
         except Exception as e:
             print(f"❌ Thumbnail generation failed for {file.filename}: {str(e)}")
@@ -329,7 +321,7 @@ async def generate_and_upload_thumbnail(file_id: str, s3_key: str, filename: str
                     user_id, folder_id, f"thumb_{filename}", "thumbnail"
                 )
                 await s3_service.upload_file(
-                    thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD
+                    thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD_IA
                 )
                 await files_collection.update_one(
                     {"_id": ObjectId(file_id)},
@@ -455,359 +447,51 @@ async def upload_complete(
         raise HTTPException(status_code=500, detail="Failed to save file record")
 
 
-@router.get("/folder/{folder_id}", response_model=PaginatedFilesResponse)
-async def get_files_in_folder(
-    folder_id: str,
-    search: Optional[str] = Query(None, description="Search by filename"),
-    page: int = Query(1, ge=1, description="Page number (1-based)"),
-    per_page: int = Query(20, ge=1, le=100, description="Number of files per page"),
-    sort_by: str = Query("filename", description="Field to sort by: filename, file_size, created_at, updated_at, file_type"),
-    sort_order: str = Query("asc", description="Sort order: asc or desc"),
-    file_type: Optional[FileType] = Query(None, description="Filter by file type: IMAGE, VIDEO, DOCUMENT, OTHER"),
-    storage_type: Optional[str] = Query(None, description="Filter by storage type: STANDARD, STANDARD_IA, GLACIER_IR, DEEP_ARCHIVE"),
-    min_size: Optional[int] = Query(None, description="Minimum file size in bytes"),
-    max_size: Optional[int] = Query(None, description="Maximum file size in bytes"),
-    user_id: str = Depends(folder_read_access),
+class AddFromGDriveRequest(BaseModel):
+    gdrive_url: str
+    folder_name: str
+    folder_storage_type: Optional[str] = None
+
+@router.post("/add-from-gdrive")
+async def add_from_gdrive(
+    data: AddFromGDriveRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user)
 ):
-    """Get files in a folder with comprehensive search, filtering, pagination, and sorting"""
-    files_collection = await get_files_collection()
-    # If super_admin, skip owner/access validation
-    if current_user.user_role == UserRole.super_admin:
-        user_id = None
-    
-    # Build query
-    query = {"folder_id": folder_id}
-    
-    # Add search filter
-    if search:
-        search_pattern = {"$regex": search, "$options": "i"}
-        query["$or"] = [
-            {"filename": search_pattern},
-            {"original_filename": search_pattern}
-        ]
-    
-    # Add file type filter
-    if file_type:
-        query["file_type"] = file_type.value
-    
-    # Add storage type filter
-    if storage_type:
-        query["storage_type"] = storage_type
-    
-    # Add file size filters
-    if min_size is not None or max_size is not None:
-        size_filter = {}
-        if min_size is not None:
-            size_filter["$gte"] = min_size
-        if max_size is not None:
-            size_filter["$lte"] = max_size
-        query["file_size"] = size_filter
-    
-    # Validate and set sort parameters
-    allowed_sort_fields = ["filename", "file_size", "created_at", "updated_at", "file_type", "original_filename"]
-    if sort_by not in allowed_sort_fields:
-        sort_by = "filename"
-    
-    sort_direction = 1 if sort_order.lower() == "asc" else -1
-    
-    # Get total count for pagination metadata
-    total_count = await files_collection.count_documents(query)
-    
-    # Calculate pagination metadata
-    pagination_meta = calculate_pagination_metadata(total_count, page, per_page)
-    
-    # Calculate skip for database query
-    skip = calculate_skip_from_page(page, per_page)
-    
-    # Get files with pagination and sorting
-    cursor = files_collection.find(query).skip(skip).limit(per_page).sort(sort_by, sort_direction)
-    files = await cursor.to_list(None)
-    
-    # Convert to response format with fresh presigned URLs
-    result = []
-    tasks = []
-    
-    for file_doc in files:
-        file_doc["_id"] = str(file_doc["_id"])
-        
-        # Create tasks for parallel presigned URL generation
-        if file_doc.get("s3_key"):
-            tasks.append(s3_service.generate_presigned_url(file_doc["s3_key"], 3600))
-        else:
-            tasks.append(None)
-            
-        if file_doc.get("thumbnail_s3_key"):
-            tasks.append(s3_service.generate_presigned_url(file_doc["thumbnail_s3_key"], 3600))
-        else:
-            tasks.append(None)
-        
-        result.append(file_doc)
-    
-    # Execute all S3 calls in parallel
-    if tasks:
-        presigned_urls = await asyncio.gather(*[task for task in tasks if task is not None])
-        
-        # Assign results back to files
-        url_index = 0
-        for file_doc in result:
-            if file_doc.get("s3_key"):
-                file_doc["s3_url"] = presigned_urls[url_index]
-                url_index += 1
-            if file_doc.get("thumbnail_s3_key"):
-                file_doc["thumbnail_s3_url"] = presigned_urls[url_index]
-                url_index += 1
-    
-    # Convert to File objects
-    file_objects = [File(**file_doc) for file_doc in result]
-    
-    return PaginatedFilesResponse(
-        data=file_objects,
-        meta=pagination_meta
-    )
+    # 1. Check if GDrive is public
+    if not is_drive_public(data.gdrive_url):
+        return JSONResponse(status_code=400, content={"success": False, "message": "Google Drive folder is not public."})
 
+    # 2. Validate storage type
+    storage_type = data.folder_storage_type or FolderStorageType.GLACIER_IR.value
+    valid_types = {t.value for t in StorageType}
+    if storage_type not in valid_types:
+        return JSONResponse(status_code=400, content={"success": False, "message": f"Invalid folder_storage_type. Must be one of: {', '.join(valid_types)}"})
 
-@router.get("/{file_id}", response_model=File)
-async def get_file(
-    file_id: str,
-    user_id: str = Depends(get_current_user_id),
-    current_user: User = Depends(get_current_user)
-):
-    """Get a specific file"""
-    files_collection = await get_files_collection()
-    
-    file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
-    if not file_doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found"
-        )
-    
-    # If not super_admin, check access
-    if not (hasattr(current_user, 'user_role') and str(current_user.user_role) == 'super_admin'):
-        await verify_folder_access(file_doc["folder_id"], user_id, AccessLevel.READ)
-    
-    file_doc["_id"] = str(file_doc["_id"])
-    
-    # Generate fresh presigned URLs (valid for 1 hour)
-    if file_doc.get("s3_key"):
-        file_doc["s3_url"] = await s3_service.generate_presigned_url(file_doc["s3_key"], 3600)
-    
-    if file_doc.get("thumbnail_s3_key"):
-        file_doc["thumbnail_s3_url"] = await s3_service.generate_presigned_url(file_doc["thumbnail_s3_key"], 3600)
-    
-    return File(**file_doc)
-
-
-@router.get("/{file_id}/download", response_model=FileDownloadResponse)
-async def download_file(
-    file_id: str,
-    user_id: str = Depends(get_current_user_id)
-):
-    """Get a presigned URL to download the file"""
-    files_collection = await get_files_collection()
-    
-    file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
-    if not file_doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found"
-        )
-    
-    # Check if file is in Deep Archive (needs restoration)
-    if file_doc.get("storage_type") == StorageType.DEEP_ARCHIVE.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File is in Deep Archive storage. Please restore it first (takes 12+ hours)."
-        )
-    
-    # Check access to the folder containing this file
-    await verify_folder_access(file_doc["folder_id"], user_id, AccessLevel.READ)
-    
-    # Generate presigned URL (valid for 1 hour)
-    presigned_url = await s3_service.generate_presigned_url(file_doc["s3_key"], 3600)
-    
-    if not presigned_url:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate download URL"
-        )
-    
-    return FileDownloadResponse(download_url=presigned_url, filename=file_doc["filename"])
-
-
-@router.get("/{file_id}/thumbnail", response_model=FileThumbnailResponse)
-async def get_thumbnail(
-    file_id: str,
-    user_id: str = Depends(get_current_user_id)
-):
-    """Get a presigned URL for the file thumbnail"""
-    files_collection = await get_files_collection()
-    
-    file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
-    if not file_doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found"
-        )
-    
-    if not file_doc.get("thumbnail_s3_key"):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Thumbnail not available for this file"
-        )
-    
-    # Check access to the folder containing this file
-    await verify_folder_access(file_doc["folder_id"], user_id, AccessLevel.READ)
-    
-    # Generate presigned URL for thumbnail (valid for 1 hour)
-    presigned_url = await s3_service.generate_presigned_url(file_doc["thumbnail_s3_key"], 3600)
-    
-    if not presigned_url:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate thumbnail URL"
-        )
-    
-    return FileThumbnailResponse(thumbnail_url=presigned_url)
-
-
-@router.put("/{file_id}", response_model=File)
-async def update_file(
-    file_id: str,
-    file_update: FileUpdate,
-    user_id: str = Depends(get_current_user_id)
-):
-    """Update file information"""
-    files_collection = await get_files_collection()
-    
-    file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
-    if not file_doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found"
-        )
-    
-    # Check access to the current folder
-    await verify_folder_access(file_doc["folder_id"], user_id, AccessLevel.WRITE)
-    
-    # Build update data
-    update_data = {}
-    if file_update.filename is not None:
-        update_data["filename"] = file_update.filename
-    
-    # If moving to a different folder, check access to new folder
-    if file_update.folder_id and file_update.folder_id != file_doc["folder_id"]:
-        await verify_folder_access(file_update.folder_id, user_id, AccessLevel.WRITE)
-        
-        # Get target folder to inherit storage type
-        folders_collection = await get_folders_collection()
-        target_folder = await folders_collection.find_one({"_id": ObjectId(file_update.folder_id)})
-        if not target_folder:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Target folder not found"
-            )
-        
-        target_storage_type = StorageType(target_folder.get("storage_type", StorageType.GLACIER_IR))
-        current_storage_type = StorageType(file_doc.get("storage_type", StorageType.GLACIER_IR))
-        
-        # Update storage type if different
-        if target_storage_type != current_storage_type:
-            # Change S3 storage class
-            await s3_service.change_storage_class(file_doc["s3_key"], target_storage_type)
-            update_data["storage_type"] = target_storage_type.value
-            
-            # Handle thumbnails based on storage type change
-            if (target_storage_type == StorageType.DEEP_ARCHIVE and 
-                current_storage_type != StorageType.DEEP_ARCHIVE and 
-                file_doc.get("thumbnail_s3_key")):
-                # Keep thumbnail but remove references from database for consistency
-                # (Thumbnail will remain in S3 but won't be accessible via API)
-                update_data["thumbnail_s3_key"] = None
-                update_data["thumbnail_s3_url"] = None
-        
-        update_data["folder_id"] = file_update.folder_id
-        
-        # Update folder file counts
-        await folders_collection.update_one(
-            {"_id": ObjectId(file_doc["folder_id"])},
-            {"$inc": {"file_count": -1}}
-        )
-        await folders_collection.update_one(
-            {"_id": ObjectId(file_update.folder_id)},
-            {"$inc": {"file_count": 1}}
-        )
-    
-    update_data["updated_at"] = datetime.utcnow()
-    
-    result = await files_collection.update_one(
-        {"_id": ObjectId(file_id)},
-        {"$set": update_data}
-    )
-    
-    if result.modified_count:
-        updated_file = await files_collection.find_one({"_id": ObjectId(file_id)})
-        updated_file["_id"] = str(updated_file["_id"])
-        return File(**updated_file)
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update file"
-        )
-
-
-@router.delete("/{file_id}", response_model=FileDeleteResponse)
-async def delete_file(
-    file_id: str,
-    user_id: str = Depends(get_current_user_id)
-):
-    """Delete a file"""
-    files_collection = await get_files_collection()
+    # 3. Create root folder in DB (status copying)
     folders_collection = await get_folders_collection()
-    
-    file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
-    if not file_doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found"
-        )
-    
-    # Check access to the folder containing this file
-    await verify_folder_access(file_doc["folder_id"], user_id, AccessLevel.WRITE)
-    
-    # Check if this file has duplicates (same file_hash)
-    file_hash = file_doc.get("file_hash")
-    should_delete_s3 = True
-    should_delete_thumbnail_s3 = True
-    
-    if file_hash:
-        # Count how many files have the same hash
-        duplicate_count = await files_collection.count_documents({"file_hash": file_hash})
-        
-        if duplicate_count > 1:
-            # There are other files with the same hash, don't delete from S3
-            should_delete_s3 = False
-            should_delete_thumbnail_s3 = False
-            print(f"📁 File {file_id} has {duplicate_count} duplicates, keeping S3 objects")
-        else:
-            # This is the only file with this hash, safe to delete from S3
-            print(f"🗑️  File {file_id} is unique, deleting from S3")
-    
-    # Delete file from S3 only if it's the only copy
-    if should_delete_s3 and file_doc.get("s3_key"):
-        await s3_service.delete_file(file_doc["s3_key"])
-    
-    if should_delete_thumbnail_s3 and file_doc.get("thumbnail_s3_key"):
-        await s3_service.delete_file(file_doc["thumbnail_s3_key"])
-    
-    # Delete file record from database
-    await files_collection.delete_one({"_id": ObjectId(file_id)})
-    
-    # Update folder's file count
-    await folders_collection.update_one(
-        {"_id": ObjectId(file_doc["folder_id"])},
-        {"$inc": {"file_count": -1}}
+    folder_doc = {
+        "name": data.folder_name,
+        "parent_folder_id": None,
+        "storage_type": storage_type,
+        "owner_id": current_user.id,
+        "status": FolderStatus.COPYING.value,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+        "is_shared": False,
+        "file_count": 0,
+        "subfolder_count": 0,
+    }
+    result = await folders_collection.insert_one(folder_doc)
+    folder_id = str(result.inserted_id)
+
+    # 4. Start background task
+    background_tasks.add_task(
+        process_gdrive_import,
+        data.gdrive_url,
+        folder_id,
+        current_user.id,
+        storage_type
     )
-    
-    return FileDeleteResponse(message="File deleted successfully") 
+
+    return {"success": True, "message": "Copying started", "folder_id": folder_id, "status": "copying"} 

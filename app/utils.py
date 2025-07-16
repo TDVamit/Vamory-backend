@@ -85,6 +85,11 @@ async def apply_dynamic_folder_status(folder_doc: dict) -> dict:
     if not folder_doc:
         return folder_doc
     
+    # Preserve 'copying' status if set
+    if folder_doc.get("status") == "copying":
+        folder_doc["effective_storage_type"] = folder_doc.get("storage_type")
+        return folder_doc
+
     # Calculate current status and effective storage type
     current_status, effective_storage = await storage_conversion_service.calculate_folder_status(folder_doc)
     
@@ -135,3 +140,40 @@ async def apply_dynamic_folder_status_batch(folder_docs: list) -> list:
         updated_folders.append(updated_folder)
     
     return updated_folders 
+
+
+def determine_file_type(content_type: str, filename: str):
+    """Determine file type based on content type and file extension"""
+    from app.models.file import FileType
+    from app.config import settings
+    import os
+    file_extension = os.path.splitext(filename)[1].lower().lstrip('.')
+    if content_type.startswith('image/') or file_extension in settings.allowed_image_extensions:
+        return FileType.IMAGE
+    elif content_type.startswith('video/') or file_extension in settings.allowed_video_extensions:
+        return FileType.VIDEO
+    elif content_type in ['application/pdf', 'application/msword', 'text/plain']:
+        return FileType.DOCUMENT
+    else:
+        return FileType.OTHER
+
+def should_generate_thumbnail(storage_type, file_type):
+    """Determine if thumbnail should be generated based on storage type and file type"""
+    from app.models.file import FileType
+    from app.models.folder import StorageType
+    if file_type not in [FileType.IMAGE, FileType.VIDEO]:
+        return False
+    # Don't generate thumbnails for Deep Archive storage
+    if storage_type == StorageType.DEEP_ARCHIVE:
+        return False
+    return True
+
+def calculate_file_hash(file_content: bytes, filename: str, content_type: str, file_size: int) -> str:
+    import hashlib
+    if file_size > 20000:
+        first_10k = file_content[:10000]
+        last_10k = file_content[-10000:]
+        hash_input = content_type.encode() + str(file_size).encode() + first_10k + last_10k
+    else:
+        hash_input = content_type.encode() + str(file_size).encode() + file_content
+    return hashlib.sha256(hash_input).hexdigest() 

@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     aws_secret_access_key: str 
     aws_region: str 
     s3_bucket_name: str 
+
+    drive_api_key:str
     
     # Application Settings
     debug: bool = True
