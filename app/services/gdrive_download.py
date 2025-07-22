@@ -117,7 +117,15 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
 
             # Dedup: reuse existing S3 key if present
             existing = await files_collection.find_one({'file_hash': file_hash})
+            deduplicate = False
             if existing:
+                existing_storage = StorageType(existing['storage_type'])
+                if (
+                    (existing_storage in [StorageType.STANDARD_IA, StorageType.GLACIER_IR] and StorageType(storage_type) in [StorageType.STANDARD_IA, StorageType.GLACIER_IR]) or
+                    (existing_storage == StorageType.DEEP_ARCHIVE and StorageType(storage_type) == StorageType.DEEP_ARCHIVE)
+                ):
+                    deduplicate = True
+            if deduplicate:
                 s3_key = existing['s3_key']
                 thumbnail_key = existing.get('thumbnail_s3_key')
                 metadata = existing.get('metadata', {})

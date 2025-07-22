@@ -40,7 +40,7 @@ class S3Service:
             file_extension = os.path.splitext(filename)[1]
             return f"files/{user_id}/{folder_id}/{unique_id}{file_extension}"
 
-    async def upload_file(self, file_content: BinaryIO, s3_key: str, content_type: str, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
+    def upload_file(self, file_content: BinaryIO, s3_key: str, content_type: str, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
         """Upload file to S3 with specified storage class and return the URL"""
         try:
             s3_storage_class = self.storage_type_to_s3_class(storage_type)
@@ -165,7 +165,7 @@ class S3Service:
         except ClientError as e:
             raise Exception(f"Failed to upload multipart streaming file to S3: {str(e)}")
 
-    async def upload_large_file(self, file_content: BinaryIO, s3_key: str, content_type: str, file_size: int, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
+    def upload_large_file(self, file_content: BinaryIO, s3_key: str, content_type: str, file_size: int, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
         """Upload large file using multipart upload with specified storage class"""
         try:
             s3_storage_class = self.storage_type_to_s3_class(storage_type)
@@ -215,7 +215,7 @@ class S3Service:
                         UploadId=upload_id,
                         MultipartUpload={'Parts': parts}
                     )
-                    
+                
                 except Exception as e:
                     # Abort multipart upload on error
                     self.s3_client.abort_multipart_upload(
@@ -224,14 +224,14 @@ class S3Service:
                         UploadId=upload_id
                     )
                     raise e
+                
+                # Generate the S3 URL
+                s3_url = f"https://{self.bucket_name}.s3.{settings.aws_region}.amazonaws.com/{s3_key}"
+                return s3_url
             else:
-                # Use regular upload for smaller files
-                return await self.upload_file(file_content, s3_key, content_type, storage_type)
-            
-            # Generate the S3 URL
-            s3_url = f"https://{self.bucket_name}.s3.{settings.aws_region}.amazonaws.com/{s3_key}"
-            return s3_url
-            
+                # For smaller files, use regular upload
+                return self.upload_file(file_content, s3_key, content_type, storage_type)
+        
         except ClientError as e:
             raise Exception(f"Failed to upload large file to S3: {str(e)}")
 
@@ -339,6 +339,24 @@ class S3Service:
             return response
         except ClientError as e:
             print(f"Failed to generate presigned URL: {str(e)}")
+            return None
+
+    async def generate_download_presigned_url(self, s3_key: str, filename: str, expiration: int = 3600) -> Optional[str]:
+        """Generate a presigned URL for downloading a file with forced attachment disposition"""
+        params = {
+            'Bucket': self.bucket_name,
+            'Key': s3_key,
+            'ResponseContentDisposition': f'attachment; filename="{filename}"'
+        }
+        try:
+            response = self.s3_client.generate_presigned_url(
+                'get_object',
+                Params=params,
+                ExpiresIn=expiration
+            )
+            return response
+        except ClientError as e:
+            print(f"Failed to generate download presigned URL: {str(e)}")
             return None
 
     async def copy_file(self, source_key: str, destination_key: str) -> bool:

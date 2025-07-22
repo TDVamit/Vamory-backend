@@ -69,6 +69,7 @@ class FileInDB(FileBase):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     file_hash: Optional[str] = None
+    public_token: Optional[str] = None
 
     class Config:
         populate_by_name = True
@@ -90,6 +91,7 @@ class File(FileBase):
     created_at: datetime
     updated_at: datetime
     file_hash: Optional[str] = None
+    public_token: Optional[str] = None
 
     class Config:
         populate_by_name = True

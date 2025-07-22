@@ -97,6 +97,9 @@ class FolderInDB(FolderBase):
     deep_archive_retrieval_ready: Optional[datetime] = None      # When files will be ready
     deep_archive_retrieval_expires: Optional[datetime] = None    # When retrieval expires (back to Deep Archive)
     deep_archive_original_storage: Optional[StorageType] = None  # Original storage before Deep Archive
+    # Public sharing fields
+    is_public: bool = False
+    public_token: Optional[str] = None
 
     class Config:
         populate_by_name = True
@@ -112,6 +115,9 @@ class Folder(FolderBase):
     is_shared: bool = False
     file_count: int = 0
     subfolder_count: int = 0
+    # Public sharing fields
+    is_public: bool = False
+    public_token: Optional[str] = None
     total_size: Optional[int] = Field(None, description="Total size in bytes including all files and subfolders")
     thumbnail_url: Optional[str] = Field(None, description="Thumbnail URL of the first file in the folder, if available")
     

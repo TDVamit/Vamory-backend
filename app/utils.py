@@ -4,6 +4,7 @@ from typing import Union
 from app.models.common import PaginationMetadata
 from app.services.storage_conversion import storage_conversion_service
 from app.models.folder import FolderStatus, StorageType
+from bson import ObjectId
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -177,3 +178,17 @@ def calculate_file_hash(file_content: bytes, filename: str, content_type: str, f
     else:
         hash_input = content_type.encode() + str(file_size).encode() + file_content
     return hashlib.sha256(hash_input).hexdigest() 
+
+
+def convert_objectid(obj):
+    """
+    Recursively convert ObjectId fields to strings in dicts/lists for JSON serialization.
+    """
+    if isinstance(obj, list):
+        return [convert_objectid(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {k: convert_objectid(v) for k, v in obj.items()}
+    elif isinstance(obj, ObjectId):
+        return str(obj)
+    else:
+        return obj 

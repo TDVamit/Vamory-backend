@@ -24,11 +24,18 @@ from app.utils import (
     calculate_pagination_metadata, 
     calculate_skip_from_page,
     apply_dynamic_folder_status,
-    apply_dynamic_folder_status_batch
+    apply_dynamic_folder_status_batch,
+    convert_objectid
 )
 from app.services.storage_conversion import storage_conversion_service
 import logging
 from app.routers.auth import deny_if_viewer
+from uuid import uuid4
+from pydantic import BaseModel
+from app.models.common import PaginationMetadata
+
+class PublicSubfoldersResponse(BaseModel):
+    data: List[Folder]
 
 router = APIRouter(prefix="/folders", tags=["Folders"])
 logger = logging.getLogger(__name__)
@@ -150,7 +157,7 @@ async def create_folder(
         
         created_folder = await folders_collection.find_one({"_id": result.inserted_id})
         created_folder["_id"] = str(created_folder["_id"])
-        return Folder(**created_folder)
+        return Folder(**convert_objectid(created_folder))
     else:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -502,7 +509,7 @@ async def get_folder(
         if folder["owner_id"] == user_id:
             folder_response.shared_with = shared_users_map.get(folder_id, [])
         
-        return folder_response
+        return FolderWithAccess(**convert_objectid(folder_response.dict()))
         
     except HTTPException:
         raise
@@ -551,8 +558,7 @@ async def update_folder(
     # Get updated folder
     updated_folder = await folders_collection.find_one({"_id": ObjectId(folder_id)})
     updated_folder["_id"] = str(updated_folder["_id"])
-    
-    return Folder(**updated_folder)
+    return Folder(**convert_objectid(updated_folder))
 
 
 @router.post("/{folder_id}/change-storage-type", response_model=StorageTypeChangeResponse)
@@ -687,7 +693,7 @@ async def get_conversion_status(
         folder = await apply_dynamic_folder_status(folder)
         
         # Return status information
-        return {
+        return convert_objectid({
             "folder_id": folder_id,
             "current_status": folder.get("status"),
             "storage_type": folder.get("storage_type"),
@@ -703,7 +709,7 @@ async def get_conversion_status(
             "deep_archive_retrieval_expires": folder.get("deep_archive_retrieval_expires"),
             "retrieval_days": folder.get("retrieval_days"),
             "retrieval_mode": folder.get("retrieval_mode")
-        }
+        })
         
     except HTTPException:
         raise
@@ -987,7 +993,7 @@ async def get_folder_statistics(
             average_size_formatted=format_file_size(stat["avg_size"])
         )
     
-    return FolderStatsResponse(
+    return convert_objectid(FolderStatsResponse(
         folder_id=folder_id,
         folder_name=folder["name"],
         total_size_bytes=total_size,
@@ -995,7 +1001,7 @@ async def get_folder_statistics(
         file_count=total_files,
         subfolder_count=len(all_folder_ids) - 1,  # Subtract 1 to exclude the folder itself
         file_types=file_types
-    )
+    ))
 
 
 @router.get("/{folder_id}/shared-with")
@@ -1181,3 +1187,190 @@ async def get_folders_shared_with_me(
     except Exception as e:
         logger.error(f"Error getting shared folders: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to retrieve shared folders") 
+
+
+@router.post("/{folder_id}/check-conversion")
+async def check_folder_conversion_status(
+    folder_id: str,
+    user_id: str = Depends(folder_admin_access),
+    current_user: User = Depends(get_current_user)
+):
+    """Check if all files in the folder and all subfolders are converted to the folder's target storage type. If so, update folder status to ACTIVE."""
+    try:
+        folders_collection = await get_folders_collection()
+        folder = await folders_collection.find_one({"_id": ObjectId(folder_id)})
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        target_storage_str = folder.get("conversion_to_storage")
+        if not target_storage_str:
+            raise HTTPException(status_code=400, detail="Folder does not have a target conversion storage type (conversion_to_storage)")
+        from app.models.folder import StorageType
+        target_storage = StorageType(target_storage_str)
+        result = await storage_conversion_service.check_and_update_folder_conversion_status(
+            folder_id=folder_id,
+            target_storage=target_storage,
+            apply_to_children=True
+        )
+        if not result.get("success"):
+            # Add estimated ready time if available
+            estimated_ready = folder.get("deep_archive_retrieval_ready")
+            if estimated_ready:
+                result["estimated_ready_time"] = estimated_ready
+        return convert_objectid(result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error checking conversion status for folder {folder_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to check conversion status") 
+
+
+@router.post("/{folder_id}/make-public")
+async def make_folder_public(
+    folder_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Make a folder public and generate a public token (owner/admin only, recursive for subfolders and files)"""
+    folders_collection = await get_folders_collection()
+    files_collection = await get_files_collection()
+    folder = await folders_collection.find_one({"_id": ObjectId(folder_id)})
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    if folder["owner_id"] != current_user.id and current_user.user_role != UserRole.super_admin:
+        raise HTTPException(status_code=403, detail="Not authorized to make this folder public")
+    
+
+    parent_folder_id = folder.get("parent_folder_id")
+    public_token = str(uuid4())
+    if parent_folder_id:
+        parent_folder = await folders_collection.find_one({"_id": ObjectId(parent_folder_id)})
+        if parent_folder and parent_folder.get("public_token"):
+            public_token = parent_folder.get("public_token")
+    # Find all descendant folders (including the main one)
+    all_folder_ids = [str(folder["_id"])]
+    queue = [str(folder["_id"])]
+    while queue:
+        current_id = queue.pop()
+        children = await folders_collection.find({"parent_folder_id": current_id}).to_list(None)
+        for child in children:
+            child_id = str(child["_id"])
+            all_folder_ids.append(child_id)
+            queue.append(child_id)
+    # Update all folders
+    await folders_collection.update_many(
+        {"_id": {"$in": [ObjectId(fid) for fid in all_folder_ids]}},
+        {"$set": {"is_public": True, "public_token": public_token}}
+    )
+    # Update all files in these folders
+    await files_collection.update_many(
+        {"folder_id": {"$in": all_folder_ids}},
+        {"$set": {"public_token": public_token}}
+    )
+    return {"message": "Folder and all subfolders/files are now public", "public_token": public_token}
+
+@router.post("/{folder_id}/make-private")
+async def make_folder_private(
+    folder_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Make a folder private and remove its public token (owner/admin only, recursive for subfolders and files)"""
+    folders_collection = await get_folders_collection()
+    files_collection = await get_files_collection()
+    folder = await folders_collection.find_one({"_id": ObjectId(folder_id)})
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    if folder["owner_id"] != current_user.id and current_user.user_role != UserRole.super_admin:
+        raise HTTPException(status_code=403, detail="Not authorized to make this folder private")
+    # Check parent folder for public_token
+    parent_folder_id = folder.get("parent_folder_id")
+    if parent_folder_id:
+        parent_folder = await folders_collection.find_one({"_id": ObjectId(parent_folder_id)})
+        if parent_folder and parent_folder.get("public_token"):
+            return {"success": False, "reason": "Parent folder is public. Cannot make private."}
+    # Find all descendant folders (including the main one)
+    all_folder_ids = [str(folder["_id"])]
+    queue = [str(folder["_id"])]
+    while queue:
+        current_id = queue.pop()
+        children = await folders_collection.find({"parent_folder_id": current_id}).to_list(None)
+        for child in children:
+            child_id = str(child["_id"])
+            all_folder_ids.append(child_id)
+            queue.append(child_id)
+    # Update all folders
+    await folders_collection.update_many(
+        {"_id": {"$in": [ObjectId(fid) for fid in all_folder_ids]}},
+        {"$set": {"is_public": False, "public_token": None}}
+    )
+    # Update all files in these folders
+    await files_collection.update_many(
+        {"folder_id": {"$in": all_folder_ids}},
+        {"$set": {"public_token": None}}
+    )
+    return {"message": "Folder and all subfolders/files are now private"}
+
+public_router = APIRouter(prefix="/public/folders", tags=["Public Folders"])
+
+@public_router.get("/{public_token}", response_model=Folder)
+async def get_public_folder(public_token: str):
+    """Get public folder info by token (no auth required)"""
+    folders_collection = await get_folders_collection()
+    folder = await folders_collection.find_one({"public_token": public_token, "is_public": True})
+    if not folder:
+        raise HTTPException(status_code=404, detail="Public folder not found or not public")
+    folder["_id"] = str(folder["_id"])
+    return Folder(**folder)
+
+@public_router.get("/{public_token}/path/{folder_path:path}", response_model=Folder)
+async def get_public_folder_by_path(public_token: str, folder_path: str):
+    """Get a public folder by path (e.g., /Photos/2024/Vacation)"""
+    folders_collection = await get_folders_collection()
+    # Find root folder by token
+    root_folder = await folders_collection.find_one({"public_token": public_token, "is_public": True})
+    if not root_folder:
+        raise HTTPException(status_code=404, detail="Public folder not found or not public")
+    current_folder = root_folder
+    if folder_path:
+        parts = [p for p in folder_path.split("/") if p]
+        for part in parts:
+            next_folder = await folders_collection.find_one({
+                "parent_folder_id": str(current_folder["_id"]),
+                "name": part,
+                "is_public": True,
+                "public_token": public_token
+            })
+            if not next_folder:
+                raise HTTPException(status_code=404, detail="Folder path not found or not public")
+            current_folder = next_folder
+    current_folder["_id"] = str(current_folder["_id"])
+    return Folder(**current_folder)
+
+class PaginatedPublicSubfoldersResponse(BaseModel):
+    data: List[Folder]
+    meta: PaginationMetadata
+
+@public_router.get("/", response_model=PaginatedPublicSubfoldersResponse)
+async def get_public_subfolders(
+    token: str,
+    folder_id: str,
+    page: int = 1,
+    per_page: int = 20
+):
+    """Get paginated list of subfolders for a public folder by token and folder_id"""
+    folders_collection = await get_folders_collection()
+    # Validate parent folder is public and token matches
+    parent_folder = await folders_collection.find_one({"_id": ObjectId(folder_id), "is_public": True, "public_token": token})
+    if not parent_folder:
+        raise HTTPException(status_code=404, detail="Public folder not found or not public")
+    # Count total subfolders
+    total_count = await folders_collection.count_documents({"parent_folder_id": folder_id, "is_public": True, "public_token": token})
+    # Pagination
+    skip = (page - 1) * per_page
+    cursor = folders_collection.find({"parent_folder_id": folder_id, "is_public": True, "public_token": token}).skip(skip).limit(per_page)
+    subfolders = await cursor.to_list(None)
+    for subfolder in subfolders:
+        subfolder["_id"] = str(subfolder["_id"])
+    meta = calculate_pagination_metadata(total_count, page, per_page)
+    return PaginatedPublicSubfoldersResponse(data=[Folder(**subfolder) for subfolder in subfolders], meta=meta)
+
+# Register the public router
+router.include_router(public_router) 

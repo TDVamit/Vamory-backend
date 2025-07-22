@@ -12,7 +12,7 @@ from app.services.auth import (
 from app.dependencies import get_current_user
 from app.database import get_users_collection
 from app.config import settings
-from app.utils import calculate_pagination_metadata, calculate_skip_from_page
+from app.utils import calculate_pagination_metadata, calculate_skip_from_page, convert_objectid
 import base64
 from app.services.thumbnail import thumbnail_service
 from io import BytesIO
