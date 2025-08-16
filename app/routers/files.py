@@ -14,7 +14,7 @@ from app.models.file import (
 from app.models.folder import StorageType as FolderStorageType, AccessLevel, StorageType, FolderStatus
 from app.models.user import User, UserRole
 from app.dependencies import get_current_user, get_current_user_id, folder_read_access, folder_write_access, verify_folder_access
-from app.database import get_files_collection, get_folders_collection
+from app.database import get_files_collection, get_folders_collection, get_faces_collection
 from app.services.s3 import s3_service
 from app.services.thumbnail import thumbnail_service
 from app.config import settings
@@ -25,9 +25,18 @@ import asyncio
 from app.routers.auth import deny_if_viewer
 from app.services.gdrive_utility import is_drive_public
 from app.services.gdrive_download import process_gdrive_import
+from app.models.file import FileType, StorageType
+from app.services.s3 import s3_service
+from app.services.thumbnail import thumbnail_service
+from app.database import get_files_collection, get_folders_collection, get_faces_collection
+from app.services.face_recognition import face_detection, get_faces_for_file, get_unknown_faces, update_face_name
+import io, os
+from bson import ObjectId
+from app.services.AI_search_util import get_image_description
+from app.services.vector_db import VectorDB
 
 router = APIRouter(prefix="/files", tags=["Files"])
-
+vector_db = VectorDB()
 
 def determine_file_type(content_type: str, filename: str) -> FileType:
     """Determine file type based on content type and file extension"""
@@ -129,7 +138,9 @@ async def upload_file(
     await file.seek(0)
     file_content = await file.read()
     await file.seek(0)
-    file_hash = calculate_file_hash(file_content, file.filename, file.content_type, file_size)
+    # Run file hash calculation in thread pool
+    loop = asyncio.get_event_loop()
+    file_hash = await loop.run_in_executor(None, calculate_file_hash, file_content, file.filename, file.content_type, file_size)
     # Deduplication check BEFORE upload
     existing = await files_collection.find_one({'file_hash': file_hash})
     deduplicate = False
@@ -158,7 +169,8 @@ async def upload_file(
             storage_type=folder_storage_type,
             metadata=existing.get('metadata', {}),
             file_hash=file_hash,
-            public_token=public_token
+            public_token=public_token,
+            face_references=existing.get('face_references') or []
         )
         result = await files_collection.insert_one(file_in_db.dict(by_alias=True))
         if result.inserted_id:
@@ -170,6 +182,10 @@ async def upload_file(
             thumbnail_presigned_url = None
             if existing.get('thumbnail_s3_key'):
                 thumbnail_presigned_url = await s3_service.generate_presigned_url(existing['thumbnail_s3_key'], 3600)
+            face_references = existing.get('face_references') or []
+            faces_coll = await get_faces_collection()
+            unknown_faces = await faces_coll.count_documents({'_id': {'$in': [ObjectId(fr['face_id']) for fr in face_references]}, 'name': None})
+
             return FileUploadResponse(
                 file_id=str(result.inserted_id),
                 filename=file.filename,
@@ -177,7 +193,8 @@ async def upload_file(
                 file_type=file_type,
                 s3_url=file_presigned_url,
                 thumbnail_url=thumbnail_presigned_url,
-                storage_type=folder_storage_type
+                storage_type=folder_storage_type,
+                unknown_faces=unknown_faces
             )
         else:
             raise HTTPException(status_code=500, detail="Failed to save file record")
@@ -199,18 +216,58 @@ async def upload_file(
     s3_key = s3_service.generate_s3_key(user_id, folder_id, file.filename)
     s3_url = await s3_service.upload_streaming_file(file, s3_key, folder_storage_type)
     
+    # Create file record first to get file ID
+    file_in_db = FileInDB(
+        filename=file.filename,
+        original_filename=file.filename,
+        file_type=file_type,
+        content_type=file.content_type,
+        file_size=file_size,
+        folder_id=folder_id,
+        owner_id=user_id,
+        s3_key=s3_key,
+        s3_url="",  # Don't store static URLs
+        thumbnail_s3_key=None,
+        thumbnail_s3_url="",  # Don't store static URLs
+        storage_type=folder_storage_type,
+        metadata={},
+        file_hash=file_hash,
+        public_token=public_token,
+        face_references=[]
+    )
+    
+    result = await files_collection.insert_one(file_in_db.dict(by_alias=True))
+    file_id = str(result.inserted_id)
+    
     # Generate thumbnail after S3 upload using the pre-read content
     thumbnail_s3_key = None
+    calculated_faces = []
+    calculated_unknown_faces = 0
     if file_content and len(file_content) > 0:
         try:
             if file_type == FileType.IMAGE:
                 image_stream = io.BytesIO(file_content)
-                metadata = thumbnail_service.get_image_metadata(image_stream)
+                # Run synchronous operations in thread pool
+                loop = asyncio.get_event_loop()
+                metadata = await loop.run_in_executor(None, thumbnail_service.get_image_metadata, image_stream)
                 image_stream.seek(0)
-                thumbnail_stream = thumbnail_service.generate_thumbnail(image_stream)
+                thumbnail_stream = await loop.run_in_executor(None, thumbnail_service.generate_thumbnail, image_stream)
+                image_stream.seek(0)
+                calculated_faces,calculated_unknown_faces = await face_detection(image_stream, user_id, file_id)
+                image_stream.seek(0)
+                image_description = await get_image_description(image_stream.getvalue())
+                
+                # Run vector DB operations in thread pool
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, vector_db.add, image_description, file_id, user_id)
+                
+                # Store image description in metadata
+                metadata["image_description"] = image_description
+
             elif file_type == FileType.VIDEO:
                 video_stream = io.BytesIO(file_content)
-                thumbnail_stream = thumbnail_service.generate_video_thumbnail(video_stream)
+                loop = asyncio.get_event_loop()
+                thumbnail_stream = await loop.run_in_executor(None, thumbnail_service.generate_video_thumbnail, video_stream)
                 metadata = {
                     'format': file_extension,
                     'content_type': file.content_type,
@@ -220,12 +277,17 @@ async def upload_file(
                 thumbnail_stream = None
             
             if thumbnail_stream:
+                # Ensure the thumbnail stream is properly positioned
+                thumbnail_stream.seek(0)
                 thumbnail_s3_key = s3_service.generate_s3_key(
                     user_id, folder_id, f"thumb_{file.filename}", "thumbnail"
                 )
+                # Upload thumbnail to S3
                 await s3_service.upload_file(
                     thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD_IA
                 )
+            
+            
         except Exception as e:
             print(f"❌ Thumbnail generation failed for {file.filename}: {str(e)}")
             import traceback
@@ -237,26 +299,22 @@ async def upload_file(
             'size': file_size
         }
     
-    # Create file record - only store S3 keys, not URLs
-    file_in_db = FileInDB(
-        filename=file.filename,
-        original_filename=file.filename,
-        file_type=file_type,
-        content_type=file.content_type,
-        file_size=file_size,
-        folder_id=folder_id,
-        owner_id=user_id,
-        s3_key=s3_key,
-        s3_url="",  # Don't store static URLs
-        thumbnail_s3_key=thumbnail_s3_key,
-        thumbnail_s3_url="",  # Don't store static URLs
-        storage_type=folder_storage_type,
-        metadata=metadata,
-        file_hash=file_hash,
-        public_token=public_token
-    )
+    # Update file record with thumbnail and face data
+    update_data = {
+        "metadata": metadata,
+        "face_references": calculated_faces
+    }
+    if thumbnail_s3_key:
+        update_data["thumbnail_s3_key"] = thumbnail_s3_key
     
-    result = await files_collection.insert_one(file_in_db.dict(by_alias=True))
+    # Add image description if it exists
+    if "image_description" in metadata:
+        update_data["image_description"] = metadata["image_description"]
+    
+    await files_collection.update_one(
+        {"_id": result.inserted_id},
+        {"$set": update_data}
+    )
     if result.inserted_id:
         await folders_collection.update_one(
             {"_id": ObjectId(folder_id)},
@@ -273,7 +331,8 @@ async def upload_file(
             file_type=file_type,
             s3_url=file_presigned_url or s3_url,  # Fallback to static URL if presigned fails
             thumbnail_url=thumbnail_presigned_url,
-            storage_type=folder_storage_type
+            storage_type=folder_storage_type,
+            unknown_faces=calculated_unknown_faces
         )
     else:
         # Clean up S3 files if database insert failed
@@ -287,12 +346,7 @@ async def upload_file(
     
 
 async def generate_and_upload_thumbnail(file_id: str, s3_key: str, filename: str, folder_id: str, content_type: str, file_size: int, user_id: str):
-    from app.models.file import FileType, StorageType
-    from app.services.s3 import s3_service
-    from app.services.thumbnail import thumbnail_service
-    from app.database import get_files_collection, get_folders_collection
-    import io, os
-    from bson import ObjectId
+
     files_collection = await get_files_collection()
     folders_collection = await get_folders_collection()
     file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
@@ -320,39 +374,78 @@ async def generate_and_upload_thumbnail(file_id: str, s3_key: str, filename: str
              or (file_type == FileType.VIDEO and thumbnail_service.can_generate_video_thumbnail(content_type)))
         and file_size <= 200 * 1024 * 1024):
         try:
+            calculated_faces = []
             if file_type == FileType.IMAGE:
                 image_stream = io.BytesIO(file_obj.getvalue())
-                metadata = thumbnail_service.get_image_metadata(image_stream)
+                # Run synchronous operations in thread pool
+                loop = asyncio.get_event_loop()
+                metadata = await loop.run_in_executor(None, thumbnail_service.get_image_metadata, image_stream)
                 image_stream.seek(0)
-                thumbnail_stream = thumbnail_service.generate_thumbnail(image_stream)
+                thumbnail_stream = await loop.run_in_executor(None, thumbnail_service.generate_thumbnail, image_stream)
+                image_stream.seek(0)
+                calculated_faces, _ = await face_detection(image_stream, user_id, str(file_id))
+                image_stream.seek(0)
+                image_description = await get_image_description(image_stream.getvalue())
+                
+                # Run vector DB operations in thread pool
+                await loop.run_in_executor(None, vector_db.add, image_description, str(file_id), user_id)
+                
+                # Store image description in metadata
+                metadata["image_description"] = image_description
+
             elif file_type == FileType.VIDEO:
                 video_stream = io.BytesIO(file_obj.getvalue())
-                thumbnail_stream = thumbnail_service.generate_video_thumbnail(video_stream)
+                loop = asyncio.get_event_loop()
+                thumbnail_stream = await loop.run_in_executor(None, thumbnail_service.generate_video_thumbnail, video_stream)
                 metadata = {
                     'format': file_extension,
                     'content_type': content_type,
                     'size': file_size
                 }
             if thumbnail_stream:
+                # Ensure the thumbnail stream is properly positioned
+                thumbnail_stream.seek(0)
                 thumbnail_s3_key = s3_service.generate_s3_key(
                     user_id, folder_id, f"thumb_{filename}", "thumbnail"
                 )
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda: s3_service.upload_file(
-                        thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD_IA
-                    )
+                await s3_service.upload_file(
+                    thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD_IA
                 )
+                update_data = {
+                    "thumbnail_s3_key": thumbnail_s3_key,
+                    "metadata": metadata,
+                    "face_references": calculated_faces
+                }
+                
+                # Add image description if it exists
+                if "image_description" in metadata:
+                    update_data["image_description"] = metadata["image_description"]
+                
                 await files_collection.update_one(
                     {"_id": ObjectId(file_id)},
-                    {"$set": {
-                        "thumbnail_s3_key": thumbnail_s3_key,
-                        "metadata": metadata
-                    }}
+                    {"$set": update_data}
                 )
         except Exception as e:
             print(f"Thumbnail generation failed (background): {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+            # Try to update the file record with basic metadata even if thumbnail generation fails
+            try:
+                basic_metadata = {
+                    'format': file_extension,
+                    'content_type': content_type,
+                    'size': file_size
+                }
+                
+                await files_collection.update_one(
+                    {"_id": ObjectId(file_id)},
+                    {"$set": {"metadata": basic_metadata}}
+                )
+                print(f"✅ Updated file record with basic metadata for {filename}")
+            except Exception as update_error:
+                print(f"❌ Failed to update file record: {str(update_error)}")
+    
     # No deletion of file record if thumbnail fails
 
 
@@ -407,7 +500,8 @@ async def upload_complete(
             storage_type=storage_type,
             metadata=existing.get('metadata', {}),
             file_hash=data.file_hash,
-            public_token=public_token
+            public_token=public_token,
+            face_references=existing.get('face_references') or []
         )
         result = await files_collection.insert_one(file_in_db.dict(by_alias=True))
         if result.inserted_id:
@@ -419,6 +513,10 @@ async def upload_complete(
             thumbnail_presigned_url = None
             if existing.get('thumbnail_s3_key'):
                 thumbnail_presigned_url = await s3_service.generate_presigned_url(existing['thumbnail_s3_key'], 3600)
+
+            face_references = existing.get('face_references') or []
+            faces_coll = await get_faces_collection()
+            unknown_faces = await faces_coll.count_documents({'_id': {'$in': [ObjectId(fr['face_id']) for fr in face_references]}, 'name': None})
             return FileUploadResponse(
                 file_id=str(result.inserted_id),
                 filename=data.filename,
@@ -426,7 +524,8 @@ async def upload_complete(
                 file_type=file_type,
                 s3_url=file_presigned_url,
                 thumbnail_url=thumbnail_presigned_url,
-                storage_type=storage_type
+                storage_type=storage_type,
+                unknown_faces=unknown_faces
             )
         else:
             raise HTTPException(status_code=500, detail="Failed to save file record")
@@ -446,7 +545,8 @@ async def upload_complete(
         storage_type=storage_type,
         metadata={},
         file_hash=data.file_hash,
-        public_token=public_token
+        public_token=public_token,
+        face_references=[]
     )
     result = await files_collection.insert_one(file_in_db.dict(by_alias=True))
     if result.inserted_id:
@@ -473,7 +573,8 @@ async def upload_complete(
             file_type=file_type,
             s3_url=file_presigned_url,
             thumbnail_url=None,
-            storage_type=storage_type
+            storage_type=storage_type,
+            unknown_faces=0
         )
     else:
         raise HTTPException(status_code=500, detail="Failed to save file record")
@@ -508,8 +609,8 @@ async def add_from_gdrive(
         "storage_type": storage_type,
         "owner_id": current_user.id,
         "status": FolderStatus.COPYING.value,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
+                        "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
         "is_shared": False,
         "file_count": 0,
         "subfolder_count": 0,
@@ -714,6 +815,7 @@ async def download_file(
 @router.get("/{file_id}/public/download", response_model=FileDownloadResponse)
 async def download_file(
     file_id: str,
+    current_user: User = Depends(get_current_user)
 ):
     """Get a presigned URL to download the file"""
     files_collection = await get_files_collection()
@@ -735,7 +837,7 @@ async def download_file(
     # Skip access check if file is public
     print(file_doc)
     if not file_doc.get("public_token"):
-        await verify_folder_access(file_doc["folder_id"], user_id, AccessLevel.READ)
+        await verify_folder_access(file_doc["folder_id"], current_user.id, AccessLevel.READ)
     
     # Generate presigned URL (valid for 1 hour) with forced download
     presigned_url = await s3_service.generate_download_presigned_url(file_doc["s3_key"], file_doc["filename"], 3600)
@@ -851,7 +953,7 @@ async def update_file(
             {"$inc": {"file_count": 1}}
         )
     
-    update_data["updated_at"] = datetime.utcnow()
+    update_data["updated_at"] = datetime.now(timezone.utc)
     
     result = await files_collection.update_one(
         {"_id": ObjectId(file_id)},
@@ -867,6 +969,109 @@ async def update_file(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update file"
         )
+
+
+async def cleanup_faces_and_vector_db(file_id: str, user_id: str):
+    """Clean up faces and vector database entries when a file is deleted"""
+    try:
+        print(f"🧹 Starting cleanup for file {file_id}")
+        
+        # Clean up faces
+        faces_collection = await get_faces_collection()
+        
+        # Find all faces that reference this file
+        faces_with_file = await faces_collection.find({
+            'owner_id': user_id,
+            'file_references.file_id': file_id
+        }).to_list(length=None)
+        
+        print(f"📸 Found {len(faces_with_file)} faces referencing file {file_id}")
+        
+        for face in faces_with_file:
+            face_id = str(face['_id'])
+            face_name = face.get('name', 'Unknown')
+            
+            # Remove this file reference from the face
+            await faces_collection.update_one(
+                {'_id': face['_id']},
+                {'$pull': {'file_references': {'file_id': file_id}}}
+            )
+            
+            # If this was the last file reference for this face, delete the face
+            updated_face = await faces_collection.find_one({'_id': face['_id']})
+            if updated_face and len(updated_face.get('file_references', [])) == 0:
+                await faces_collection.delete_one({'_id': face['_id']})
+                print(f"🗑️  Deleted face '{face_name}' ({face_id}) - no more file references")
+            else:
+                remaining_refs = len(updated_face.get('file_references', [])) if updated_face else 0
+                print(f"📝 Updated face '{face_name}' ({face_id}) - {remaining_refs} file references remaining")
+        
+        # Clean up vector database
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, vector_db.delete, f"{user_id}:{file_id}")
+        print(f"🗑️  Deleted vector DB entry for file {file_id}")
+        
+        print(f"✅ Cleanup completed for file {file_id}")
+        
+    except Exception as e:
+        print(f"⚠️  Error during cleanup: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
+async def bulk_cleanup_faces_and_vector_db(file_ids: list, user_id: str):
+    """Clean up faces and vector database entries for multiple files"""
+    try:
+        print(f"🧹 Starting bulk cleanup for {len(file_ids)} files")
+        
+        faces_collection = await get_faces_collection()
+        
+        # Find all faces that reference any of these files
+        faces_with_files = await faces_collection.find({
+            'owner_id': user_id,
+            'file_references.file_id': {'$in': file_ids}
+        }).to_list(length=None)
+        
+        print(f"📸 Found {len(faces_with_files)} faces referencing the files")
+        
+        faces_to_delete = []
+        
+        for face in faces_with_files:
+            face_id = str(face['_id'])
+            face_name = face.get('name', 'Unknown')
+            
+            # Remove all file references for these files
+            await faces_collection.update_one(
+                {'_id': face['_id']},
+                {'$pull': {'file_references': {'file_id': {'$in': file_ids}}}}
+            )
+            
+            # Check if face has any remaining file references
+            updated_face = await faces_collection.find_one({'_id': face['_id']})
+            if updated_face and len(updated_face.get('file_references', [])) == 0:
+                faces_to_delete.append(face['_id'])
+                print(f"🗑️  Marked face '{face_name}' ({face_id}) for deletion - no more file references")
+            else:
+                remaining_refs = len(updated_face.get('file_references', [])) if updated_face else 0
+                print(f"📝 Updated face '{face_name}' ({face_id}) - {remaining_refs} file references remaining")
+        
+        # Delete faces with no remaining references
+        if faces_to_delete:
+            result = await faces_collection.delete_many({'_id': {'$in': faces_to_delete}})
+            print(f"🗑️  Deleted {result.deleted_count} faces with no remaining file references")
+        
+        # Clean up vector database entries
+        loop = asyncio.get_event_loop()
+        for file_id in file_ids:
+            await loop.run_in_executor(None, vector_db.delete, f"{user_id}:{file_id}")
+        
+        print(f"🗑️  Deleted {len(file_ids)} vector DB entries")
+        print(f"✅ Bulk cleanup completed for {len(file_ids)} files")
+        
+    except Exception as e:
+        print(f"⚠️  Error during bulk cleanup: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 @router.delete("/{file_id}", response_model=FileDeleteResponse)
@@ -905,6 +1110,9 @@ async def delete_file(
         else:
             # This is the only file with this hash, safe to delete from S3
             print(f"🗑️  File {file_id} is unique, deleting from S3")
+    
+    # Clean up faces and vector database before deleting file
+    await cleanup_faces_and_vector_db(file_id, user_id)
     
     # Delete file from S3 only if it's the only copy
     if should_delete_s3 and file_doc.get("s3_key"):
@@ -1018,5 +1226,73 @@ async def get_public_file_by_id(token: str, file_id: str):
         file_doc["thumbnail_s3_url"] = await s3_service.generate_presigned_url(file_doc["thumbnail_s3_key"], 3600)
     return File(**file_doc)
 
+
+
+@public_router.get('/unlabeled/')
+async def get_unlabeled_photos(
+    user_id: str = Depends(get_current_user_id),
+    page: int = 1,
+    per_page: int = 20,
+):
+    """
+    Return paginated list of photos with unknown faces
+    """
+    from app.database import get_faces_collection
+    
+    faces_collection = await get_faces_collection()
+    files_collection = await get_files_collection()
+    
+    skip = (page - 1) * per_page
+    
+    # Get unknown faces with file references
+    unknown_faces = await faces_collection.find(
+        {'owner_id': user_id, 'name': None},
+        {'embedding': 0}  # Exclude embedding
+    ).skip(skip).limit(per_page).to_list(length=per_page)
+    
+    total = await faces_collection.count_documents({'owner_id': user_id, 'name': None})
+    
+    results = []
+    for face in unknown_faces:
+        for file_ref in face.get('file_references', []):
+            # Get file info
+            file_doc = await files_collection.find_one(
+                {'_id': ObjectId(file_ref['file_id']), 'archival_status': 'active'},
+                {'s3_key': 1}
+            )
+            if file_doc:
+                results.append({
+                    'face_id': str(face['_id']),
+                    'photo_id': file_ref['file_id'],
+                    's3_url': await s3_service.generate_presigned_url(file_doc["s3_key"], 3600),
+                    'bbox': file_ref['bbox']
+                })
+
+    pagination_meta = {
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "total_pages": (total + per_page - 1) // per_page
+    }
+    return {
+        "data": results,
+        "meta": pagination_meta
+    }
+
+@public_router.post('/label/')
+async def label_face(face_id: str, name: str, user_id: str = Depends(get_current_user_id)):
+    """Update face name using the new centralized face management system"""
+    files_affected = await update_face_name(face_id, name, user_id)
+    return {
+        'status': 'ok',
+        'face_id': face_id,
+        'name': name,
+        'files_affected': files_affected
+    }
+
+
+
 # Register the public router
 router.include_router(public_router) 
+
+

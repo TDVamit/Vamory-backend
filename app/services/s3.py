@@ -40,21 +40,26 @@ class S3Service:
             file_extension = os.path.splitext(filename)[1]
             return f"files/{user_id}/{folder_id}/{unique_id}{file_extension}"
 
-    def upload_file(self, file_content: BinaryIO, s3_key: str, content_type: str, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
+    async def upload_file(self, file_content: BinaryIO, s3_key: str, content_type: str, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
         """Upload file to S3 with specified storage class and return the URL"""
         try:
             s3_storage_class = self.storage_type_to_s3_class(storage_type)
             
-            # Upload file to S3
-            self.s3_client.upload_fileobj(
-                file_content,
-                self.bucket_name,
-                s3_key,
-                ExtraArgs={
-                    'ContentType': content_type,
-                    'ACL': 'private',
-                    'StorageClass': s3_storage_class
-                }
+            # Upload file to S3 in thread pool
+            import asyncio
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self.s3_client.upload_fileobj(
+                    file_content,
+                    self.bucket_name,
+                    s3_key,
+                    ExtraArgs={
+                        'ContentType': content_type,
+                        'ACL': 'private',
+                        'StorageClass': s3_storage_class
+                    }
+                )
             )
             
             # Generate the S3 URL
@@ -79,15 +84,21 @@ class S3Service:
                 # Reset file position to beginning
                 await upload_file.seek(0)
                 
-                self.s3_client.upload_fileobj(
-                    upload_file.file,
-                    self.bucket_name,
-                    s3_key,
-                    ExtraArgs={
-                        'ContentType': upload_file.content_type,
-                        'ACL': 'private',
-                        'StorageClass': s3_storage_class
-                    }
+                # Run S3 upload in thread pool to avoid blocking
+                import asyncio
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.s3_client.upload_fileobj(
+                        upload_file.file,
+                        self.bucket_name,
+                        s3_key,
+                        ExtraArgs={
+                            'ContentType': upload_file.content_type,
+                            'ACL': 'private',
+                            'StorageClass': s3_storage_class
+                        }
+                    )
                 )
             
             # Generate the S3 URL
@@ -103,12 +114,17 @@ class S3Service:
             s3_storage_class = self.storage_type_to_s3_class(storage_type)
             
             # Create multipart upload
-            response = self.s3_client.create_multipart_upload(
-                Bucket=self.bucket_name,
-                Key=s3_key,
-                ContentType=upload_file.content_type,
-                ACL='private',
-                StorageClass=s3_storage_class
+            import asyncio
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.s3_client.create_multipart_upload(
+                    Bucket=self.bucket_name,
+                    Key=s3_key,
+                    ContentType=upload_file.content_type,
+                    ACL='private',
+                    StorageClass=s3_storage_class
+                )
             )
             
             upload_id = response['UploadId']
@@ -126,12 +142,15 @@ class S3Service:
                     if not chunk:
                         break
                     
-                    part_response = self.s3_client.upload_part(
-                        Bucket=self.bucket_name,
-                        Key=s3_key,
-                        PartNumber=part_number,
-                        UploadId=upload_id,
-                        Body=chunk
+                    part_response = await loop.run_in_executor(
+                        None,
+                        lambda: self.s3_client.upload_part(
+                            Bucket=self.bucket_name,
+                            Key=s3_key,
+                            PartNumber=part_number,
+                            UploadId=upload_id,
+                            Body=chunk
+                        )
                     )
                     
                     parts.append({
@@ -142,19 +161,25 @@ class S3Service:
                     part_number += 1
                 
                 # Complete multipart upload
-                self.s3_client.complete_multipart_upload(
-                    Bucket=self.bucket_name,
-                    Key=s3_key,
-                    UploadId=upload_id,
-                    MultipartUpload={'Parts': parts}
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.s3_client.complete_multipart_upload(
+                        Bucket=self.bucket_name,
+                        Key=s3_key,
+                        UploadId=upload_id,
+                        MultipartUpload={'Parts': parts}
+                    )
                 )
                 
             except Exception as e:
                 # Abort multipart upload on error
-                self.s3_client.abort_multipart_upload(
-                    Bucket=self.bucket_name,
-                    Key=s3_key,
-                    UploadId=upload_id
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.s3_client.abort_multipart_upload(
+                        Bucket=self.bucket_name,
+                        Key=s3_key,
+                        UploadId=upload_id
+                    )
                 )
                 raise e
             
@@ -165,7 +190,7 @@ class S3Service:
         except ClientError as e:
             raise Exception(f"Failed to upload multipart streaming file to S3: {str(e)}")
 
-    def upload_large_file(self, file_content: BinaryIO, s3_key: str, content_type: str, file_size: int, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
+    async def upload_large_file(self, file_content: BinaryIO, s3_key: str, content_type: str, file_size: int, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
         """Upload large file using multipart upload with specified storage class"""
         try:
             s3_storage_class = self.storage_type_to_s3_class(storage_type)
@@ -173,12 +198,17 @@ class S3Service:
             # For files larger than 100MB, use multipart upload
             if file_size > 100 * 1024 * 1024:  # 100MB
                 # Create multipart upload
-                response = self.s3_client.create_multipart_upload(
-                    Bucket=self.bucket_name,
-                    Key=s3_key,
-                    ContentType=content_type,
-                    ACL='private',
-                    StorageClass=s3_storage_class
+                import asyncio
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: self.s3_client.create_multipart_upload(
+                        Bucket=self.bucket_name,
+                        Key=s3_key,
+                        ContentType=content_type,
+                        ACL='private',
+                        StorageClass=s3_storage_class
+                    )
                 )
                 
                 upload_id = response['UploadId']
@@ -193,12 +223,15 @@ class S3Service:
                         if not chunk:
                             break
                         
-                        part_response = self.s3_client.upload_part(
-                            Bucket=self.bucket_name,
-                            Key=s3_key,
-                            PartNumber=part_number,
-                            UploadId=upload_id,
-                            Body=chunk
+                        part_response = await loop.run_in_executor(
+                            None,
+                            lambda: self.s3_client.upload_part(
+                                Bucket=self.bucket_name,
+                                Key=s3_key,
+                                PartNumber=part_number,
+                                UploadId=upload_id,
+                                Body=chunk
+                            )
                         )
                         
                         parts.append({
@@ -209,19 +242,25 @@ class S3Service:
                         part_number += 1
                     
                     # Complete multipart upload
-                    self.s3_client.complete_multipart_upload(
-                        Bucket=self.bucket_name,
-                        Key=s3_key,
-                        UploadId=upload_id,
-                        MultipartUpload={'Parts': parts}
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.s3_client.complete_multipart_upload(
+                            Bucket=self.bucket_name,
+                            Key=s3_key,
+                            UploadId=upload_id,
+                            MultipartUpload={'Parts': parts}
+                        )
                     )
                 
                 except Exception as e:
                     # Abort multipart upload on error
-                    self.s3_client.abort_multipart_upload(
-                        Bucket=self.bucket_name,
-                        Key=s3_key,
-                        UploadId=upload_id
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.s3_client.abort_multipart_upload(
+                            Bucket=self.bucket_name,
+                            Key=s3_key,
+                            UploadId=upload_id
+                        )
                     )
                     raise e
                 
@@ -230,7 +269,7 @@ class S3Service:
                 return s3_url
             else:
                 # For smaller files, use regular upload
-                return self.upload_file(file_content, s3_key, content_type, storage_type)
+                return await self.upload_file(file_content, s3_key, content_type, storage_type)
         
         except ClientError as e:
             raise Exception(f"Failed to upload large file to S3: {str(e)}")
@@ -238,7 +277,12 @@ class S3Service:
     async def delete_file(self, s3_key: str) -> bool:
         """Delete file from S3"""
         try:
-            self.s3_client.delete_object(Bucket=self.bucket_name, Key=s3_key)
+            import asyncio
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self.s3_client.delete_object(Bucket=self.bucket_name, Key=s3_key)
+            )
             return True
         except ClientError as e:
             print(f"Failed to delete file from S3: {str(e)}")
@@ -260,9 +304,14 @@ class S3Service:
                 delete_objects = [{'Key': key} for key in batch]
                 
                 try:
-                    response = self.s3_client.delete_objects(
-                        Bucket=self.bucket_name,
-                        Delete={'Objects': delete_objects}
+                    import asyncio
+                    loop = asyncio.get_event_loop()
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda: self.s3_client.delete_objects(
+                            Bucket=self.bucket_name,
+                            Delete={'Objects': delete_objects}
+                        )
                     )
                     
                     total_deleted += len(response.get('Deleted', []))
@@ -282,13 +331,18 @@ class S3Service:
             s3_storage_class = self.storage_type_to_s3_class(target_storage_type)
             
             # Copy the object to itself with new storage class
+            import asyncio
+            loop = asyncio.get_event_loop()
             copy_source = {'Bucket': self.bucket_name, 'Key': s3_key}
-            self.s3_client.copy_object(
-                CopySource=copy_source,
-                Bucket=self.bucket_name,
-                Key=s3_key,
-                StorageClass=s3_storage_class,
-                MetadataDirective='COPY'
+            await loop.run_in_executor(
+                None,
+                lambda: self.s3_client.copy_object(
+                    CopySource=copy_source,
+                    Bucket=self.bucket_name,
+                    Key=s3_key,
+                    StorageClass=s3_storage_class,
+                    MetadataDirective='COPY'
+                )
             )
             return True
         except ClientError as e:
@@ -331,10 +385,15 @@ class S3Service:
             if content_type:
                 params['ContentType'] = content_type
         try:
-            response = self.s3_client.generate_presigned_url(
-                method,
-                Params=params,
-                ExpiresIn=expiration
+            import asyncio
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.s3_client.generate_presigned_url(
+                    method,
+                    Params=params,
+                    ExpiresIn=expiration
+                )
             )
             return response
         except ClientError as e:
@@ -349,10 +408,15 @@ class S3Service:
             'ResponseContentDisposition': f'attachment; filename="{filename}"'
         }
         try:
-            response = self.s3_client.generate_presigned_url(
-                'get_object',
-                Params=params,
-                ExpiresIn=expiration
+            import asyncio
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.s3_client.generate_presigned_url(
+                    'get_object',
+                    Params=params,
+                    ExpiresIn=expiration
+                )
             )
             return response
         except ClientError as e:
@@ -362,11 +426,16 @@ class S3Service:
     async def copy_file(self, source_key: str, destination_key: str) -> bool:
         """Copy file within S3"""
         try:
+            import asyncio
+            loop = asyncio.get_event_loop()
             copy_source = {'Bucket': self.bucket_name, 'Key': source_key}
-            self.s3_client.copy_object(
-                CopySource=copy_source,
-                Bucket=self.bucket_name,
-                Key=destination_key
+            await loop.run_in_executor(
+                None,
+                lambda: self.s3_client.copy_object(
+                    CopySource=copy_source,
+                    Bucket=self.bucket_name,
+                    Key=destination_key
+                )
             )
             return True
         except ClientError as e:
@@ -376,7 +445,12 @@ class S3Service:
     async def get_file_info(self, s3_key: str) -> Optional[dict]:
         """Get file information from S3"""
         try:
-            response = self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            import asyncio
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            )
             return {
                 'size': response['ContentLength'],
                 'last_modified': response['LastModified'],
@@ -390,15 +464,20 @@ class S3Service:
     async def restore_from_deep_archive(self, s3_key: str, days: int = 1) -> bool:
         """Initiate restore from Deep Archive (can take 12+ hours)"""
         try:
-            self.s3_client.restore_object(
-                Bucket=self.bucket_name,
-                Key=s3_key,
-                RestoreRequest={
-                    'Days': days,
-                    'GlacierJobParameters': {
-                        'Tier': 'Standard'  # Standard, Expedited, or Bulk
+            import asyncio
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self.s3_client.restore_object(
+                    Bucket=self.bucket_name,
+                    Key=s3_key,
+                    RestoreRequest={
+                        'Days': days,
+                        'GlacierJobParameters': {
+                            'Tier': 'Standard'  # Standard, Expedited, or Bulk
+                        }
                     }
-                }
+                )
             )
             return True
         except ClientError as e:

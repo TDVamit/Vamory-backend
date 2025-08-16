@@ -1,10 +1,25 @@
 from PIL import Image, ImageOps
 import io
+import json
+import re
 from typing import Optional, BinaryIO
 from app.config import settings
 import ffmpeg
 import tempfile
 import os
+
+
+def sanitize_for_json(obj):
+    """Recursively sanitize an object to ensure it's JSON-safe"""
+    if isinstance(obj, dict):
+        return {key: sanitize_for_json(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, str):
+        # Remove control characters except newline, tab, and carriage return
+        return re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', obj)
+    else:
+        return obj
 
 
 class ThumbnailService:
@@ -136,7 +151,8 @@ class ThumbnailService:
                         if orientation:
                             metadata['orientation'] = orientation
                 
-                return metadata
+                # Sanitize metadata to ensure it's JSON-safe
+                return sanitize_for_json(metadata)
                 
         except Exception as e:
             print(f"Failed to extract image metadata: {str(e)}")

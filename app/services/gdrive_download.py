@@ -16,13 +16,18 @@ from app.services.thumbnail import thumbnail_service
 from app.database import get_files_collection, get_folders_collection
 from app.routers.files import calculate_file_hash, should_generate_thumbnail
 from app.config import settings
+from app.services.face_recognition import face_detection
+from app.services.AI_search_util import get_image_description
+from app.services.vector_db import VectorDB
 
-# Google Drive API settings
+
 API_KEY = settings.drive_api_key
 BASE_URL = "https://www.googleapis.com/drive/v3/files"
 MEDIA_PREFIXES = ("image/", "video/")
-MAX_INFLIGHT_BYTES = 20 * 1024 ** 3  # 20 GB limit for inflight downloads
-MAX_FILE_SIZE = MAX_INFLIGHT_BYTES  # skip files larger than this
+MAX_INFLIGHT_BYTES = 20 * 1024 ** 3  
+MAX_FILE_SIZE = MAX_INFLIGHT_BYTES  
+vector_db = VectorDB()
+
 
 class ByteSemaphore:
     def __init__(self, limit_bytes: int):
@@ -58,7 +63,7 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
     files_collection = await get_files_collection()
     loop = asyncio.get_event_loop()
     byte_sem = ByteSemaphore(MAX_INFLIGHT_BYTES)
-
+    
     # Helpers
     def extract_folder_id(url: str) -> str:
         for pat in (r"/folders/([A-Za-z0-9_-]+)", r"[?&]id=([A-Za-z0-9_-]+)"):
@@ -96,7 +101,7 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
             # Prepare local path
             os.makedirs(local_dir, exist_ok=True)
             temp_path = os.path.join(local_dir, name)
-
+            faces = []
             # Download file stream
             url = f"{BASE_URL}/{fid}"
             params = {"alt": "media", "key": API_KEY}
@@ -110,7 +115,7 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
             async with aiofiles.open(temp_path, 'rb') as f:
                 content = await f.read()
             content_type = mime
-            file_hash = calculate_file_hash(content, name, content_type, size)
+            file_hash = await loop.run_in_executor(None, functools.partial(calculate_file_hash, content, name, content_type, size))
 
             # Determine file type
             file_type = FileType.IMAGE if mime.startswith('image/') else FileType.VIDEO
@@ -129,14 +134,13 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                 s3_key = existing['s3_key']
                 thumbnail_key = existing.get('thumbnail_s3_key')
                 metadata = existing.get('metadata', {})
+                faces = existing.get('faces', []) or []
             else:
                 # Upload to S3
                 s3_key = s3_service.generate_s3_key(user_id, parent_db_id, name)
                 if size > 100 * 1024**2:
                     # Offload blocking S3 upload to thread pool
-                    await loop.run_in_executor(None, functools.partial(
-                        s3_service.upload_large_file, open(temp_path, 'rb'), s3_key, content_type, size, StorageType(storage_type)
-                    ))
+                    await s3_service.upload_large_file(open(temp_path, 'rb'), s3_key, content_type, size, StorageType(storage_type))
                 else:
                     await loop.run_in_executor(None, functools.partial(
                         s3_service.upload_file, open(temp_path, 'rb'), s3_key, content_type, StorageType(storage_type)
@@ -152,6 +156,16 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                             metadata = await loop.run_in_executor(None, functools.partial(thumbnail_service.get_image_metadata, image_stream))
                             image_stream.seek(0)
                             thumbnail_stream = await loop.run_in_executor(None, functools.partial(thumbnail_service.generate_thumbnail, image_stream))
+                            image_stream.seek(0)
+                            faces, _ = await face_detection(image_stream, user_id, str(fid))
+                            image_stream.seek(0)
+                            image_description = await get_image_description(image_stream.getvalue())
+                            
+                            await loop.run_in_executor(None, functools.partial(vector_db.add, image_description, str(fid), user_id))
+                            
+                            # Store image description in metadata
+                            metadata["image_description"] = image_description
+                            
                         elif file_type == FileType.VIDEO and thumbnail_service.can_generate_video_thumbnail(content_type):
                             video_stream = io.BytesIO(content)
                             thumbnail_stream = await loop.run_in_executor(None, functools.partial(thumbnail_service.generate_video_thumbnail, video_stream))
@@ -167,13 +181,9 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                             thumbnail_key = s3_service.generate_s3_key(user_id, parent_db_id, f"thumb_{name}", "thumbnail")
                             if isinstance(thumbnail_stream, io.BytesIO):
                                 thumbnail_stream.seek(0)
-                                await loop.run_in_executor(None, functools.partial(
-                                    s3_service.upload_file, thumbnail_stream, thumbnail_key, "image/webp", StorageType(storage_type)
-                                ))
+                                await s3_service.upload_file(thumbnail_stream, thumbnail_key, "image/webp", StorageType(storage_type))
                             else:
-                                await loop.run_in_executor(None, functools.partial(
-                                    s3_service.upload_file, io.BytesIO(thumbnail_stream), thumbnail_key, "image/webp", StorageType(storage_type)
-                                ))
+                                await s3_service.upload_file(io.BytesIO(thumbnail_stream), thumbnail_key, "image/webp", StorageType(storage_type))
                     except Exception as e:
                         print(f"[THUMBNAIL ERROR] {name}: {e}")
 
@@ -192,7 +202,9 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                 thumbnail_s3_url="",
                 storage_type=StorageType(storage_type),
                 metadata=metadata,
-                file_hash=file_hash
+                file_hash=file_hash,
+                face_references=faces,
+                image_description=metadata.get("image_description")
             )
             await files_collection.insert_one(file_doc.dict(by_alias=True))
             await folders_collection.update_one({'_id': ObjectId(parent_db_id)}, {'$inc': {'file_count': 1}})
@@ -215,8 +227,8 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                 "storage_type": storage_type,
                 "owner_id": user_id,
                 "status": FolderStatus.ACTIVE.value,
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
                 "is_shared": False,
                 "file_count": 0,
                 "subfolder_count": 0,

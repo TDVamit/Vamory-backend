@@ -2,8 +2,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.database import connect_to_mongo, close_mongo_connection
-from app.routers import auth, folders, files
+from app.routers import auth, folders, files, faces, ai_search
 from app.config import settings
+import tflite_runtime.interpreter as tflite
+import os
+
+
+model_path = os.path.join(os.path.dirname(__file__), 'app','face_models', 'mobilefacenet.tflite')
+interpreter = tflite.Interpreter(model_path)
+interpreter.allocate_tensors()
+
 
 
 @asynccontextmanager
@@ -36,6 +44,8 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(folders.router, prefix="/api/v1")
 app.include_router(files.router, prefix="/api/v1")
+app.include_router(faces.router, prefix="/api/v1")
+app.include_router(ai_search.router, prefix="/api/v1")
 
 
 @app.get("/")

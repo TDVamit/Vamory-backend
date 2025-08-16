@@ -21,3 +21,6 @@ aiohttp==3.9.1  # For testing large file uploads
 # DNS resolution fix for MongoDB Atlas
 dnspython>=2.3.0
 ffmpeg-python==0.2.0
+mediapipe
+tflite-runtime
+google-genai

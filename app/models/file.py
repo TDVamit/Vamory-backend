@@ -70,6 +70,8 @@ class FileInDB(FileBase):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     file_hash: Optional[str] = None
     public_token: Optional[str] = None
+    face_references: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+    image_description: Optional[str] = None
 
     class Config:
         populate_by_name = True
@@ -92,6 +94,8 @@ class File(FileBase):
     updated_at: datetime
     file_hash: Optional[str] = None
     public_token: Optional[str] = None
+    face_references: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+    image_description: Optional[str] = None
 
     class Config:
         populate_by_name = True
@@ -113,6 +117,7 @@ class FileUploadResponse(BaseModel):
     thumbnail_url: Optional[str] = None
     upload_status: str = "completed"
     storage_type: StorageType
+    unknown_faces : Optional[int] = None
 
 
 class FileMetadata(BaseModel):

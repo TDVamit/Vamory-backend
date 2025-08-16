@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     allowed_video_extensions: Union[str, List[str]] = "mp4,avi,mov,wmv,flv,webm,mkv,m4v"
     thumbnail_size: int = 300
     thumbnail_quality: int = 85
+
+    GEMINI_API_KEY:str
+    GEMINI_VISION_MODEL:str
+    OPENAI_API_KEY:str
+    OPENAI_EMBEDDING_MODEL:str
     
     @field_validator('allowed_image_extensions', 'allowed_video_extensions')
     @classmethod

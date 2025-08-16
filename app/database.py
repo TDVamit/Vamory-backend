@@ -13,13 +13,11 @@ class Database:
     client: Optional[AsyncIOMotorClient] = None
     database = None
 
-
 db = Database()
 
 
 async def get_database():
     return db.database
-
 
 async def connect_to_mongo():
     """Create database connection"""
@@ -58,4 +56,9 @@ async def get_folder_access_collection():
 
 async def get_refresh_tokens_collection():
     database = await get_database()
-    return database.refresh_tokens 
+    return database.refresh_tokens
+
+
+async def get_faces_collection():
+    database = await get_database()
+    return database.faces 

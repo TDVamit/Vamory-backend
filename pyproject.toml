@@ -3,7 +3,7 @@ name = "backend"
 version = "0.1.0"
 description = "FastAPI Gallery Backend with MongoDB and S3"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10, <3.11"
 dependencies = [
     "fastapi>=0.104.1",
     "uvicorn[standard]>=0.24.0",
@@ -13,7 +13,7 @@ dependencies = [
     "python-multipart>=0.0.6",
     "python-jose[cryptography]>=3.3.0",
     "python-dotenv>=1.0.0",
-    "Pillow>=10.1.0",
+    "pillow>=10.1.0",
     "aiofiles>=23.2.1",
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
@@ -23,6 +23,15 @@ dependencies = [
     "ffmpeg-python>=0.2.0",
     "requests>=2.32.4",
     "aiohttp>=3.12.14",
+    "mediapipe>=0.10.21",
+    "langchain>=0.3.27",
+    "openai>=1.99.0",
+    "faiss-cpu>=1.11.0.post1",
+    "google-generativeai>=0.8.5",
+    "google-genai>=1.30.0",
+    "langchain-community>=0.3.27",
+    "langchain-core>=0.3.72",
+    "langchain-openai>=0.3.28",
 ]
 
 [tool.ruff]
@@ -32,3 +41,10 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 ignore = []
+
+[[tool.uv.index]]
+name = "coral"
+url = "https://google-coral.github.io/py-repo/"
+
+[tool.uv.sources]
+"tflite-runtime" = { index = "coral" }
