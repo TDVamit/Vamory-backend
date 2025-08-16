@@ -47,4 +47,4 @@ name = "coral"
 url = "https://google-coral.github.io/py-repo/"
 
 [tool.uv.sources]
-"tflite-runtime" = { index = "coral" }
+"tflite-runtime" = { path = "./tflite_runtime-2.14.0-cp310-cp310-linux_x86_64.whl" }
