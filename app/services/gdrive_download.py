@@ -7,7 +7,7 @@ import functools
 import shutil
 import aiohttp
 import aiofiles
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 from app.models.file import FileType, FileInDB
 from app.models.folder import StorageType, FolderStatus
@@ -18,7 +18,9 @@ from app.routers.files import calculate_file_hash, should_generate_thumbnail
 from app.config import settings
 from app.services.face_recognition import face_detection
 from app.services.AI_search_util import get_image_description
-from app.services.vector_db import VectorDB
+from app.services.video_processing import video_processor
+from app.services.vector_db import vector_db
+from openai import AsyncOpenAI
 
 
 API_KEY = settings.drive_api_key
@@ -26,7 +28,7 @@ BASE_URL = "https://www.googleapis.com/drive/v3/files"
 MEDIA_PREFIXES = ("image/", "video/")
 MAX_INFLIGHT_BYTES = 20 * 1024 ** 3  
 MAX_FILE_SIZE = MAX_INFLIGHT_BYTES  
-vector_db = VectorDB()
+openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 
 class ByteSemaphore:
@@ -161,7 +163,13 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                             image_stream.seek(0)
                             image_description = await get_image_description(image_stream.getvalue())
                             
-                            await loop.run_in_executor(None, functools.partial(vector_db.add, image_description, str(fid), user_id))
+                            # Generate embedding and add to vector DB
+                            embedding_response = await openai_client.embeddings.create(
+                                model=settings.OPENAI_EMBEDDING_MODEL,
+                                input=image_description
+                            )
+                            image_vector = embedding_response.data[0].embedding
+                            await vector_db.add(image_description, str(fid), user_id, image_vector)
                             
                             # Store image description in metadata
                             metadata["image_description"] = image_description
@@ -169,11 +177,45 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                         elif file_type == FileType.VIDEO and thumbnail_service.can_generate_video_thumbnail(content_type):
                             video_stream = io.BytesIO(content)
                             thumbnail_stream = await loop.run_in_executor(None, functools.partial(thumbnail_service.generate_video_thumbnail, video_stream))
-                            metadata = {
-                                'format': os.path.splitext(name)[1].lower().lstrip('.'),
-                                'content_type': content_type,
-                                'size': size
-                            }
+                            
+                            # Process video for description
+                            try:
+                                # Save video to temp file for processing
+                                import tempfile
+                                with tempfile.NamedTemporaryFile(suffix=f".{os.path.splitext(name)[1].lower().lstrip('.')}", delete=False) as temp_video:
+                                    temp_video.write(content)
+                                    temp_video_path = temp_video.name
+                                
+                                # Generate video description with transcription
+                                video_description = await video_processor.process_video(temp_video_path)
+                                
+                                # Generate embedding and add to vector database
+                                embedding_response = await openai_client.embeddings.create(
+                                    model=settings.OPENAI_EMBEDDING_MODEL,
+                                    input=video_description
+                                )
+                                video_vector = embedding_response.data[0].embedding
+                                await vector_db.add(video_description, str(fid), user_id, video_vector)
+                                
+                                metadata = {
+                                    'format': os.path.splitext(name)[1].lower().lstrip('.'),
+                                    'content_type': content_type,
+                                    'size': size
+                                }
+                                
+                                # Clean up temp file
+                                try:
+                                    os.unlink(temp_video_path)
+                                except:
+                                    pass
+                                    
+                            except Exception as e:
+                                print(f"[VIDEO PROCESSING ERROR] {name}: {e}")
+                                metadata = {
+                                    'format': os.path.splitext(name)[1].lower().lstrip('.'),
+                                    'content_type': content_type,
+                                    'size': size
+                                }
                         else:
                             thumbnail_stream = None
 
@@ -204,9 +246,10 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                 metadata=metadata,
                 file_hash=file_hash,
                 face_references=faces,
-                image_description=metadata.get("image_description")
+                image_description=metadata.get("image_description"),
+                video_description=video_description if 'video_description' in locals() else None
             )
-            await files_collection.insert_one(file_doc.dict(by_alias=True))
+            result = await files_collection.insert_one(file_doc.dict(by_alias=True))
             await folders_collection.update_one({'_id': ObjectId(parent_db_id)}, {'$inc': {'file_count': 1}})
 
         finally:

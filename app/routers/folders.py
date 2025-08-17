@@ -15,10 +15,11 @@ from app.models.file import FileType
 from app.dependencies import get_current_user, folder_read_access, folder_write_access, folder_admin_access, verify_folder_access
 from app.database import (
     get_folders_collection, get_folder_access_collection, 
-    get_users_collection, get_files_collection
+    get_users_collection, get_files_collection, get_faces_collection
 )
 from app.services.s3 import s3_service
 from app.services.folder import folder_service
+from app.services.vector_db import vector_db
 from app.utils import (
     format_file_size, 
     calculate_pagination_metadata, 
@@ -741,7 +742,60 @@ async def delete_folder(
         
         await get_children(parent_id)
         return all_folders
-    
+
+    async def bulk_cleanup_faces_and_vector_db(file_ids: list, user_id: str):
+        """Clean up faces and vector database entries for multiple files"""
+        try:
+            print(f"🧹 Starting bulk cleanup for {len(file_ids)} files")
+            
+            faces_collection = await get_faces_collection()
+            
+            # Find all faces that reference any of these files
+            faces_with_files = await faces_collection.find({
+                'owner_id': user_id,
+                'file_references.file_id': {'$in': file_ids}
+            }).to_list(length=None)
+            
+            print(f"📸 Found {len(faces_with_files)} faces referencing the files")
+            
+            faces_to_delete = []
+            
+            for face in faces_with_files:
+                face_id = str(face['_id'])
+                face_name = face.get('name', 'Unknown')
+                
+                # Remove all file references for these files
+                await faces_collection.update_one(
+                    {'_id': face['_id']},
+                    {'$pull': {'file_references': {'file_id': {'$in': file_ids}}}}
+                )
+                
+                # Check if face has any remaining file references
+                updated_face = await faces_collection.find_one({'_id': face['_id']})
+                if updated_face and len(updated_face.get('file_references', [])) == 0:
+                    faces_to_delete.append(face['_id'])
+                    print(f"🗑️  Marked face '{face_name}' ({face_id}) for deletion - no more file references")
+                else:
+                    remaining_refs = len(updated_face.get('file_references', [])) if updated_face else 0
+                    print(f"📝 Updated face '{face_name}' ({face_id}) - {remaining_refs} file references remaining")
+            
+            # Delete faces with no remaining references
+            if faces_to_delete:
+                result = await faces_collection.delete_many({'_id': {'$in': faces_to_delete}})
+                print(f"🗑️  Deleted {result.deleted_count} faces with no remaining file references")
+            
+            # Clean up vector database entries
+            for file_id in file_ids:
+                await vector_db.delete(f"{user_id}:{file_id}")
+            
+            print(f"🗑️  Deleted {len(file_ids)} vector DB entries")
+            print(f"✅ Bulk cleanup completed for {len(file_ids)} files")
+            
+        except Exception as e:
+            print(f"⚠️  Error during bulk cleanup: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
     try:
         # Get all folder IDs to delete (including subfolders)
         folder_ids_to_delete = await get_all_subfolders(folder_id)
@@ -750,6 +804,9 @@ async def delete_folder(
         files_to_delete = await files_collection.find({
             "folder_id": {"$in": folder_ids_to_delete}
         }).to_list(None)
+        
+        # Extract file IDs for cleanup
+        file_ids_to_cleanup = [str(file_doc["_id"]) for file_doc in files_to_delete]
         
         # Delete files from S3 (only if not referenced elsewhere)
         s3_keys_to_delete = set()
@@ -770,6 +827,10 @@ async def delete_folder(
         if s3_keys_to_delete:
             delete_result = await s3_service.delete_files_batch(list(s3_keys_to_delete))
             logger.info(f"Deleted {delete_result.get('deleted', 0)} files from S3 for folder {folder_id}")
+        
+        # Clean up faces and vector database entries before deleting files
+        if file_ids_to_cleanup:
+            await bulk_cleanup_faces_and_vector_db(file_ids_to_cleanup, user_id)
         
         # Delete files from database
         files_delete_result = await files_collection.delete_many({

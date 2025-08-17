@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     GEMINI_VISION_MODEL:str
     OPENAI_API_KEY:str
     OPENAI_EMBEDDING_MODEL:str
+    speech_is_cheap_api_key:str
+    qdrant_api_key:str
+    qdrant_url:str
     
     @field_validator('allowed_image_extensions', 'allowed_video_extensions')
     @classmethod

@@ -33,10 +33,15 @@ from app.services.face_recognition import face_detection, get_faces_for_file, ge
 import io, os
 from bson import ObjectId
 from app.services.AI_search_util import get_image_description
-from app.services.vector_db import VectorDB
+from app.services.video_processing import video_processor
+from app.services.vector_db import vector_db
+from openai import AsyncOpenAI
+from app.config import settings
 
 router = APIRouter(prefix="/files", tags=["Files"])
-vector_db = VectorDB()
+
+# Initialize OpenAI client for embeddings
+openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 def determine_file_type(content_type: str, filename: str) -> FileType:
     """Determine file type based on content type and file extension"""
@@ -257,9 +262,13 @@ async def upload_file(
                 image_stream.seek(0)
                 image_description = await get_image_description(image_stream.getvalue())
                 
-                # Run vector DB operations in thread pool
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, vector_db.add, image_description, file_id, user_id)
+                # Generate embedding and add to vector DB
+                embedding_response = await openai_client.embeddings.create(
+                    model=settings.OPENAI_EMBEDDING_MODEL,
+                    input=image_description
+                )
+                image_vector = embedding_response.data[0].embedding
+                await vector_db.add(image_description, file_id, user_id, image_vector)
                 
                 # Store image description in metadata
                 metadata["image_description"] = image_description
@@ -268,11 +277,53 @@ async def upload_file(
                 video_stream = io.BytesIO(file_content)
                 loop = asyncio.get_event_loop()
                 thumbnail_stream = await loop.run_in_executor(None, thumbnail_service.generate_video_thumbnail, video_stream)
-                metadata = {
-                    'format': file_extension,
-                    'content_type': file.content_type,
-                    'size': file_size
-                }
+                
+                # Process video for description (save to temp file first)
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=f".{file_extension}", delete=False) as temp_video:
+                    temp_video.write(file_content)
+                    temp_video_path = temp_video.name
+                
+                try:
+                    # Generate video description with transcription
+                    video_description = await video_processor.process_video(temp_video_path)
+                    
+                    # Generate embedding and add to vector database
+                    embedding_response = await openai_client.embeddings.create(
+                        model=settings.OPENAI_EMBEDDING_MODEL,
+                        input=video_description
+                    )
+                    video_vector = embedding_response.data[0].embedding
+                    await vector_db.add(video_description, file_id, user_id, video_vector)
+                    
+                    # Store video description in main field, not metadata
+                    metadata = {
+                        'format': file_extension,
+                        'content_type': file.content_type,
+                        'size': file_size
+                    }
+                    
+                    # Update the file record with video description
+                    await files_collection.update_one(
+                        {"_id": result.inserted_id},
+                        {"$set": {"video_description": video_description}}
+                    )
+                    
+                except Exception as e:
+                    print(f"❌ Video processing failed for {file.filename}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    metadata = {
+                        'format': file_extension,
+                        'content_type': file.content_type,
+                        'size': file_size
+                    }
+                finally:
+                    # Clean up temp file
+                    try:
+                        os.unlink(temp_video_path)
+                    except:
+                        pass
             else:
                 thumbnail_stream = None
             
@@ -310,6 +361,8 @@ async def upload_file(
     # Add image description if it exists
     if "image_description" in metadata:
         update_data["image_description"] = metadata["image_description"]
+    
+    # Video description is handled separately above
     
     await files_collection.update_one(
         {"_id": result.inserted_id},
@@ -387,8 +440,13 @@ async def generate_and_upload_thumbnail(file_id: str, s3_key: str, filename: str
                 image_stream.seek(0)
                 image_description = await get_image_description(image_stream.getvalue())
                 
-                # Run vector DB operations in thread pool
-                await loop.run_in_executor(None, vector_db.add, image_description, str(file_id), user_id)
+                # Generate embedding and add to vector DB
+                embedding_response = await openai_client.embeddings.create(
+                    model=settings.OPENAI_EMBEDDING_MODEL,
+                    input=image_description
+                )
+                image_vector = embedding_response.data[0].embedding
+                await vector_db.add(image_description, str(file_id), user_id, image_vector)
                 
                 # Store image description in metadata
                 metadata["image_description"] = image_description
@@ -397,6 +455,43 @@ async def generate_and_upload_thumbnail(file_id: str, s3_key: str, filename: str
                 video_stream = io.BytesIO(file_obj.getvalue())
                 loop = asyncio.get_event_loop()
                 thumbnail_stream = await loop.run_in_executor(None, thumbnail_service.generate_video_thumbnail, video_stream)
+                
+                # Process video for description
+                try:
+                    # Save video to temp file for processing
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=f".{file_extension}", delete=False) as temp_video:
+                        temp_video.write(file_obj.getvalue())
+                        temp_video_path = temp_video.name
+                    
+                    # Generate video description with transcription
+                    video_description = await video_processor.process_video(temp_video_path)
+                    
+                    # Generate embedding and add to vector database
+                    embedding_response = await openai_client.embeddings.create(
+                        model=settings.OPENAI_EMBEDDING_MODEL,
+                        input=video_description
+                    )
+                    video_vector = embedding_response.data[0].embedding
+                    await vector_db.add(video_description, str(file_id), user_id, video_vector)
+                    
+                    # Update file record with video description
+                    await files_collection.update_one(
+                        {"_id": ObjectId(file_id)},
+                        {"$set": {"video_description": video_description}}
+                    )
+                    
+                    # Clean up temp file
+                    try:
+                        os.unlink(temp_video_path)
+                    except:
+                        pass
+                        
+                except Exception as e:
+                    print(f"❌ Video processing failed for {filename}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                
                 metadata = {
                     'format': file_extension,
                     'content_type': content_type,
@@ -1007,9 +1102,27 @@ async def cleanup_faces_and_vector_db(file_id: str, user_id: str):
                 print(f"📝 Updated face '{face_name}' ({face_id}) - {remaining_refs} file references remaining")
         
         # Clean up vector database
+        print(f"🗄️  Cleaning up vector DB for file {file_id}")
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, vector_db.delete, f"{user_id}:{file_id}")
-        print(f"🗑️  Deleted vector DB entry for file {file_id}")
+        
+        # Get vector DB status before deletion for debugging
+        vector_status = await vector_db.get_status()
+        print(f"📊 Vector DB status before deletion: {vector_status}")
+        
+        # Check if document exists before deletion
+        doc_exists = await vector_db.document_exists(f"{user_id}:{file_id}")
+        print(f"🔍 Document {file_id} exists in vector DB: {doc_exists}")
+        
+        if doc_exists:
+            # Delete from vector DB
+            await vector_db.delete(f"{user_id}:{file_id}")
+            print(f"🗑️  Deleted vector DB entry for file {file_id}")
+        else:
+            print(f"⚠️  Document {file_id} not found in vector DB, skipping deletion")
+        
+        # Get vector DB status after deletion for verification
+        vector_status_after = await vector_db.get_status()
+        print(f"📊 Vector DB status after deletion: {vector_status_after}")
         
         print(f"✅ Cleanup completed for file {file_id}")
         
@@ -1061,9 +1174,8 @@ async def bulk_cleanup_faces_and_vector_db(file_ids: list, user_id: str):
             print(f"🗑️  Deleted {result.deleted_count} faces with no remaining file references")
         
         # Clean up vector database entries
-        loop = asyncio.get_event_loop()
         for file_id in file_ids:
-            await loop.run_in_executor(None, vector_db.delete, f"{user_id}:{file_id}")
+            await vector_db.delete(f"{user_id}:{file_id}")
         
         print(f"🗑️  Deleted {len(file_ids)} vector DB entries")
         print(f"✅ Bulk cleanup completed for {len(file_ids)} files")

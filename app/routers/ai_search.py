@@ -5,15 +5,17 @@ import asyncio
 
 from app.dependencies import get_current_user_id
 from app.services.AI_search_util import enhance_search
-from app.services.vector_db import VectorDB
+from app.services.vector_db import vector_db
 from app.database import get_files_collection, get_folders_collection
 from app.services.face_recognition import get_faces_for_file
 from app.services.s3 import s3_service
+from openai import AsyncOpenAI
+from app.config import settings
 
 router = APIRouter(prefix="/ai-search", tags=["AI Search"])
 
-# Initialize global VectorDB instance (reuse across requests)
-vector_db = VectorDB()
+# Initialize OpenAI client for embeddings
+openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 
 async def get_folder_and_subfolder_ids(folder_id: str, user_id: str) -> set:
@@ -103,10 +105,17 @@ async def ai_search(
         # Normalise names to lowercase for comparison consistency
         mentioned_names = [name.lower() for name in mentioned_names]
 
-        # 2. Vector DB search (top 20)
-        search_results = vector_db.query(enhanced_query, user_id, top_k=20)
+        # 2. Generate embedding for the enhanced query
+        embedding_response = await openai_client.embeddings.create(
+            model=settings.OPENAI_EMBEDDING_MODEL,
+            input=enhanced_query
+        )
+        query_vector = embedding_response.data[0].embedding
         
-        image_ids = [res["image_id"] for res in search_results]
+        # 3. Vector DB search (top 20)
+        search_results = await vector_db.query(enhanced_query, user_id, query_vector, top_k=20)
+        
+        image_ids = [res["payload"]["image_id"] for res in search_results]
 
         # Prepare category structure
         categories: Dict[str, List[Dict[str, Any]]] = _initialize_category_structure(mentioned_names)
@@ -137,7 +146,7 @@ async def ai_search(
         # Generate presigned URLs for all files in parallel
         presigned_url_tasks = []
         for res in search_results:
-            img_id = res["image_id"]
+            img_id = res["payload"]["image_id"]
             file_doc = file_docs_map.get(img_id)
             if not file_doc:
                 continue  # Skip missing docs
@@ -163,7 +172,7 @@ async def ai_search(
             # Assign presigned URLs back to file documents
             url_index = 0
             for res in search_results:
-                img_id = res["image_id"]
+                img_id = res["payload"]["image_id"]
                 file_doc = file_docs_map.get(img_id)
                 if not file_doc:
                     continue
@@ -177,17 +186,25 @@ async def ai_search(
 
         # Iterate over vector results preserving relevance order
         for res in search_results:
-            img_id = res["image_id"]
+            img_id = res["payload"]["image_id"]
             file_doc = file_docs_map.get(img_id)
             if not file_doc:
                 continue  # Skip missing docs
 
-            # 3. Fetch faces for the file to identify names present
-            faces_info = await get_faces_for_file(img_id, user_id)
-            names_in_image = {f.get("name", "").lower() for f in faces_info if f.get("name")}
-
-            # 4. Categorize
-            _place_in_category(categories, file_doc, names_in_image, mentioned_names)
+            # Check file type to handle differently
+            file_type = file_doc.get("file_type", "image")
+            
+            if file_type == "video":
+                # For videos, don't detect faces, just categorize based on content
+                # Videos are categorized in "videos" category
+                if "videos" not in categories:
+                    categories["videos"] = []
+                categories["videos"].append(file_doc)
+            else:
+                # For images, fetch faces and categorize by names
+                faces_info = await get_faces_for_file(img_id, user_id)
+                names_in_image = {f.get("name", "").lower() for f in faces_info if f.get("name")}
+                _place_in_category(categories, file_doc, names_in_image, mentioned_names)
 
         return {"categories": categories}
 
@@ -196,17 +213,7 @@ async def ai_search(
 
 
 
-@router.post("/reload", summary="Force reload vector database")
-async def reload_vector_db( user_id: str = Depends(get_current_user_id),):
-    """Force reload the vector database from disk"""
-    try:
-        success = vector_db.force_reload()
-        if success:
-            return {"message": "Vector database reloaded successfully", "status": vector_db.get_status()}
-        else:
-            return {"message": "Failed to reload vector database"}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
 
 
 
