@@ -33,7 +33,7 @@ app = FastAPI(
 # CORS middleware with support for large file uploads
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly for production
+    allow_origins=["https://vamory.vadaevri.com"],  # Configure this properly for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
