@@ -56,7 +56,6 @@ class S3Service:
                     s3_key,
                     ExtraArgs={
                         'ContentType': content_type,
-                        'ACL': 'private',
                         'StorageClass': s3_storage_class
                     }
                 )
@@ -95,7 +94,6 @@ class S3Service:
                         s3_key,
                         ExtraArgs={
                             'ContentType': upload_file.content_type,
-                            'ACL': 'private',
                             'StorageClass': s3_storage_class
                         }
                     )
@@ -117,15 +115,14 @@ class S3Service:
             import asyncio
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
-                None,
-                lambda: self.s3_client.create_multipart_upload(
-                    Bucket=self.bucket_name,
-                    Key=s3_key,
-                    ContentType=upload_file.content_type,
-                    ACL='private',
-                    StorageClass=s3_storage_class
+                    None,
+                    lambda: self.s3_client.create_multipart_upload(
+                        Bucket=self.bucket_name,
+                        Key=s3_key,
+                        ContentType=upload_file.content_type,
+                        StorageClass=s3_storage_class
+                    )
                 )
-            )
             
             upload_id = response['UploadId']
             parts = []
@@ -206,7 +203,6 @@ class S3Service:
                         Bucket=self.bucket_name,
                         Key=s3_key,
                         ContentType=content_type,
-                        ACL='private',
                         StorageClass=s3_storage_class
                     )
                 )
@@ -380,7 +376,6 @@ class S3Service:
         """Generate a presigned URL for file access or upload"""
         params = {'Bucket': self.bucket_name, 'Key': s3_key}
         if method == 'put_object':
-            params['ACL'] = 'private'
             params['StorageClass'] = self.storage_type_to_s3_class(storage_type)
             if content_type:
                 params['ContentType'] = content_type

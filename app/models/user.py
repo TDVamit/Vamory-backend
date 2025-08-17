@@ -34,8 +34,13 @@ class UserBase(BaseModel):
     email: EmailStr
     full_name: str = Field(..., min_length=1, max_length=100)
     is_active: bool = True
-    profile_pic: Optional[str] = None
+    credits: int = 0
+    storage_used_standard: int = 0
+    storage_used_archived: int = 0
     user_role: UserRole = UserRole.user
+    profile_pic: Optional[str] = None
+    profile_pic_s3_key: Optional[str] = None
+    profile_pic_url: Optional[str] = None
 
 
 class UserCreate(UserBase):
@@ -86,7 +91,9 @@ class UserResponse(UserBase):
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     is_active: Optional[bool] = None
-    profile_pic: Optional[str] = None
+    profile_pic: Optional[str] = None  # Base64 encoded image (legacy)
+    profile_pic_s3_key: Optional[str] = None  # S3 key for profile picture
+    profile_pic_url: Optional[str] = None  # Presigned URL for profile picture
     user_role: Optional[UserRole] = None
 
 

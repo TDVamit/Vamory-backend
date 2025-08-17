@@ -29,6 +29,7 @@ class AccessLevel(str, Enum):
 
 
 class StorageType(str, Enum):
+    STANDARD = "STANDARD"          # S3 Standard
     STANDARD_IA = "STANDARD_IA"    # S3 Standard – Infrequent Access (IA)
     GLACIER_IR = "GLACIER_IR"      # S3 Glacier Instant Retrieval
     DEEP_ARCHIVE = "DEEP_ARCHIVE"  # S3 Glacier Deep Archive
