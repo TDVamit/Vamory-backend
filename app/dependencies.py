@@ -4,25 +4,92 @@ from app.services.auth import get_current_user_id as get_user_id_from_token
 from app.database import get_users_collection, get_folders_collection, get_folder_access_collection
 from app.models.folder import AccessLevel
 from bson import ObjectId
+from jose import jwt
+import requests
+import json
+from app.config import settings
+import aiohttp
+from datetime import datetime
 
 security = HTTPBearer()
+
+AUTH0_DOMAIN = settings.AUTH0_DOMAIN 
+API_AUDIENCE = settings.API_AUDIENCE 
+ALGORITHMS = ["RS256"]
+
+
+
+_jwks = None
+
+
+
+async def _get_jwks():
+    global _jwks
+    if _jwks is None:
+        jwks_url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(jwks_url) as resp:
+                _jwks = await resp.json()
+    return _jwks
+
+async def verify_jwt(token: str) -> dict:
+    jwks = await _get_jwks()
+    unverified_header = jwt.get_unverified_header(token)
+    rsa_key = {}
+    for key in jwks["keys"]:
+        if key["kid"] == unverified_header.get("kid"):
+            rsa_key = {
+                "kty": key["kty"],
+                "kid": key["kid"],
+                "use": key["use"],
+                "n": key["n"],
+                "e": key["e"]
+            }
+    if not rsa_key:
+        raise HTTPException(status_code=401, detail="Invalid token: appropriate key not found")
+
+    try:
+        payload = jwt.decode(
+            token,
+            rsa_key,
+            algorithms=ALGORITHMS,
+            audience=API_AUDIENCE,
+            issuer=f"https://{AUTH0_DOMAIN}/"
+        )
+        return payload
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Token validation error: {str(exc)}")
 
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> "User":
     """Get current authenticated user model"""
     from app.models.user import User  # local import to avoid circular
     token = credentials.credentials
-    user_id = await get_user_id_from_token(token)
-
+    payload = await verify_jwt(token)
+    
+    sub = payload.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Invalid token: sub not found")
+    
     # Fetch user from database
     users_collection = await get_users_collection()
-    user_doc = await users_collection.find_one({"_id": ObjectId(user_id)})
+    user_doc = await users_collection.find_one({"_id": sub})
     if not user_doc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
-        )
-    # Convert ObjectId to str
+        user ={
+            "_id": sub,
+            "email": payload.get("https://vamory.vadaevri.comemail"),
+            "full_name": payload.get("https://vamory.vadaevri.comname"),
+            "user_role": "user",
+            "credits": 0,
+            "storage_used_standard": 0,
+            "storage_used_archived": 0,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+        }
+        await users_collection.insert_one(user)
+        user_doc = user
+        
+
     user_doc["_id"] = str(user_doc["_id"])
     return User(**user_doc)
 

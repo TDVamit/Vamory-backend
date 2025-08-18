@@ -28,7 +28,14 @@ async def gemini_image_vision(model,prompt,img_bytes):
         )
     )
 
-    return json.loads(response.text)
+    try:
+        # Try to parse as JSON first
+        return json.loads(response.text)
+    except json.JSONDecodeError as e:
+        # If JSON parsing fails, return the raw text
+        print(f"Warning: JSON parsing failed for image vision response: {e}")
+        print(f"Raw response: {response.text}")
+        return {"description": response.text}
 
 async def gemini_text(prompt,model):
     # Initialize client (assumes GOOGLE_CLOUD_PROJECT and location set)
@@ -51,7 +58,14 @@ async def gemini_text(prompt,model):
         )
     )
 
-    return json.loads(response.text)
+    try:
+        # Try to parse as JSON first
+        return json.loads(response.text)
+    except json.JSONDecodeError as e:
+        # If JSON parsing fails, return the raw text
+        print(f"Warning: JSON parsing failed for text response: {e}")
+        print(f"Raw response: {response.text}")
+        return {"text": response.text}
 
 async def gemini_image_vision_search(model,prompt,img_bytes):
     # Initialize client (assumes GOOGLE_CLOUD_PROJECT and location set)

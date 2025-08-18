@@ -72,6 +72,7 @@ class FileInDB(FileBase):
     public_token: Optional[str] = None
     face_references: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
     image_description: Optional[str] = None
+    video_description: Optional[str] = None
 
     class Config:
         populate_by_name = True
@@ -96,6 +97,7 @@ class File(FileBase):
     public_token: Optional[str] = None
     face_references: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
     image_description: Optional[str] = None
+    video_description: Optional[str] = None
 
     class Config:
         populate_by_name = True
