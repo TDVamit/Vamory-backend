@@ -104,14 +104,15 @@ async def presign_upload(
                     "s3_key": existing['s3_key'],
                     "storage_class": s3_service.storage_type_to_s3_class(existing_storage),
                     "thumbnail_s3_key": existing.get('thumbnail_s3_key'),
-                    "file_hash": file_hash
+                    "file_hash": file_hash,
+                    "content_type": existing.get('content_type')
                 }
     s3_key = s3_service.generate_s3_key(user_id, data.folder_id, data.filename)
     # Generate presigned PUT URL with correct storage class
     presigned_url = await s3_service.generate_presigned_url(
         s3_key, 3600, method='put_object', content_type=data.content_type, storage_type=storage_type
     )
-    return {"already_uploaded": False, "url": presigned_url, "s3_key": s3_key, "storage_class": s3_service.storage_type_to_s3_class(storage_type)}
+    return {"already_uploaded": False, "url": presigned_url, "s3_key": s3_key, "storage_class": s3_service.storage_type_to_s3_class(storage_type), "content_type":data.content_type}
 
 
 @router.post("/upload", response_model=FileUploadResponse)

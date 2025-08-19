@@ -88,7 +88,10 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         }
         await users_collection.insert_one(user)
         user_doc = user
-        
+    else:
+        if user_doc.get("full_name") != payload.get("https://vamory.vadaevri.comname"):
+            await users_collection.update_one({"_id": sub}, {"$set": {"full_name": payload.get("https://vamory.vadaevri.comname")}})
+            user_doc = await users_collection.find_one({"_id": sub})       
 
     user_doc["_id"] = str(user_doc["_id"])
     return User(**user_doc)
@@ -161,5 +164,33 @@ folder_admin_access = FolderAccessChecker(AccessLevel.ADMIN)
 async def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """Get current authenticated user ID as string"""
     token = credentials.credentials
-    user_id = await get_user_id_from_token(token)
-    return user_id 
+    payload = await verify_jwt(token)
+        
+    sub = payload.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Invalid token: sub not found")
+    
+    # Fetch user from database
+    users_collection = await get_users_collection()
+    user_doc = await users_collection.find_one({"_id": sub})
+
+    if not user_doc:
+        user ={
+            "_id": sub,
+            "email": payload.get("https://vamory.vadaevri.comemail"),
+            "full_name": payload.get("https://vamory.vadaevri.comname"),
+            "user_role": "user",
+            "credits": 0,
+            "storage_used_standard": 0,
+            "storage_used_archived": 0,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+        }
+        await users_collection.insert_one(user)
+        user_doc = user
+    else:
+        if user_doc.get("full_name") != payload.get("https://vamory.vadaevri.comname"):
+            await users_collection.update_one({"_id": sub}, {"$set": {"full_name": payload.get("https://vamory.vadaevri.comname")}})
+            user_doc = await users_collection.find_one({"_id": sub})
+    
+    return str(user_doc["_id"])
