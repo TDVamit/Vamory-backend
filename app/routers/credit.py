@@ -21,7 +21,7 @@ async def get_exchange_rate(
     base: str = Query(..., description="Base currency code (e.g., 'USD')"),
     amount: float = Query(..., description="Amount to convert", gt=0),
     target: str = Query(default="USD", description="Target currency code (e.g., 'EUR')"),
-    current_user: User = Depends(get_current_user)
+   
 ):
     """
     Get current exchange rate and convert amount from base currency to target currency.
