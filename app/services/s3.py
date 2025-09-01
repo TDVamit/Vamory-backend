@@ -22,11 +22,10 @@ class S3Service:
         """Convert our storage type enum to S3 storage class"""
         mapping = {
             StorageType.STANDARD: "STANDARD",
-            StorageType.STANDARD_IA: "STANDARD_IA",
-            StorageType.GLACIER_IR: "GLACIER_IR", 
+            StorageType.GLACIER_IR: "GLACIER_IR",
             StorageType.DEEP_ARCHIVE: "DEEP_ARCHIVE"
         }
-        return mapping.get(storage_type, "GLACIER_IR")
+        return mapping.get(storage_type, "STANDARD")
 
     def generate_s3_key(self, user_id: str, folder_id: str, filename: str, file_type: str = "file") -> str:
         """Generate a unique S3 key for a file"""
@@ -40,7 +39,7 @@ class S3Service:
             file_extension = os.path.splitext(filename)[1]
             return f"files/{user_id}/{folder_id}/{unique_id}{file_extension}"
 
-    async def upload_file(self, file_content: BinaryIO, s3_key: str, content_type: str, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
+    async def upload_file(self, file_content: BinaryIO, s3_key: str, content_type: str, storage_type: StorageType = StorageType.STANDARD) -> str:
         """Upload file to S3 with specified storage class and return the URL"""
         try:
             s3_storage_class = self.storage_type_to_s3_class(storage_type)
@@ -68,7 +67,7 @@ class S3Service:
         except ClientError as e:
             raise Exception(f"Failed to upload file to S3: {str(e)}")
 
-    async def upload_streaming_file(self, upload_file: UploadFile, s3_key: str, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
+    async def upload_streaming_file(self, upload_file: UploadFile, s3_key: str, storage_type: StorageType = StorageType.STANDARD) -> str:
         """Upload file directly from FastAPI UploadFile without loading into memory"""
         try:
             s3_storage_class = self.storage_type_to_s3_class(storage_type)
@@ -187,7 +186,7 @@ class S3Service:
         except ClientError as e:
             raise Exception(f"Failed to upload multipart streaming file to S3: {str(e)}")
 
-    async def upload_large_file(self, file_content: BinaryIO, s3_key: str, content_type: str, file_size: int, storage_type: StorageType = StorageType.GLACIER_IR) -> str:
+    async def upload_large_file(self, file_content: BinaryIO, s3_key: str, content_type: str, file_size: int, storage_type: StorageType = StorageType.STANDARD) -> str:
         """Upload large file using multipart upload with specified storage class"""
         try:
             s3_storage_class = self.storage_type_to_s3_class(storage_type)
@@ -371,7 +370,7 @@ class S3Service:
         return await self.change_storage_class_batch(s3_keys, StorageType.DEEP_ARCHIVE)
 
     async def generate_presigned_url(
-        self, s3_key: str, expiration: int = 3600, method: str = 'get_object', content_type: str = None, storage_type: StorageType = StorageType.GLACIER_IR
+        self, s3_key: str, expiration: int = 3600, method: str = 'get_object', content_type: str = None, storage_type: StorageType = StorageType.STANDARD
     ) -> Optional[str]:
         """Generate a presigned URL for file access or upload"""
         params = {'Bucket': self.bucket_name, 'Key': s3_key}
@@ -469,7 +468,7 @@ class S3Service:
                     RestoreRequest={
                         'Days': days,
                         'GlacierJobParameters': {
-                            'Tier': 'Standard'  # Standard, Expedited, or Bulk
+                            'Tier': 'Standard' 
                         }
                     }
                 )

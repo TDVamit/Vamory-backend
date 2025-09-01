@@ -2,28 +2,32 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File 
 from fastapi.responses import JSONResponse
 from typing import List, Optional
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import io
 import hashlib
 from app.models.file import (
     FileCreate, File, FileUpdate, FileInDB, FileUploadResponse, 
     FileType, FileMetadata, StorageType, FileDownloadResponse, 
-    FileThumbnailResponse, FileDeleteResponse, PaginatedFilesResponse
+    FileThumbnailResponse, FileDeleteResponse, PaginatedFilesResponse,
+    ArchivalStatus, PaginatedDeletedFilesResponse, DeletedFileResponse, RestoreFileResponse
 )
 from app.models.folder import StorageType as FolderStorageType, AccessLevel, StorageType, FolderStatus
 from app.models.user import User, UserRole
-from app.dependencies import get_current_user, get_current_user_id, folder_read_access, folder_write_access, verify_folder_access
-from app.database import get_files_collection, get_folders_collection, get_faces_collection
+from app.dependencies import get_current_user, get_current_user_id, folder_read_access, folder_write_access, verify_folder_access, verify_public_token
+from app.database import get_files_collection, get_folders_collection, get_faces_collection, get_users_collection
 from app.services.s3 import s3_service
 from app.services.thumbnail import thumbnail_service
+from app.services.storage_tracking import storage_tracking_service
 from app.config import settings
 from app.utils import format_file_size, calculate_pagination_metadata, calculate_skip_from_page, calculate_file_hash, should_generate_thumbnail, determine_file_type, convert_objectid
+from app.services.billing_utils import apply_minimum_file_size, calculate_total_billing_size
 from pydantic import BaseModel
 from botocore.exceptions import ClientError
 import asyncio
 from app.routers.auth import deny_if_viewer
 from app.services.gdrive_utility import is_drive_public
+from uuid import uuid4
 from app.services.gdrive_download import process_gdrive_import
 from app.models.file import FileType, StorageType
 from app.services.s3 import s3_service
@@ -96,7 +100,8 @@ async def presign_upload(
             existing_storage = StorageType(existing['storage_type'])
             # Deduplication rules
             if (
-                (existing_storage in [StorageType.STANDARD_IA, StorageType.GLACIER_IR] and storage_type in [StorageType.STANDARD_IA, StorageType.GLACIER_IR]) or
+                (existing_storage == StorageType.STANDARD and storage_type == StorageType.STANDARD) or
+                (existing_storage == StorageType.GLACIER_IR and storage_type == StorageType.GLACIER_IR) or
                 (existing_storage == StorageType.DEEP_ARCHIVE and storage_type == StorageType.DEEP_ARCHIVE)
             ):
                 return {
@@ -153,12 +158,17 @@ async def upload_file(
     if existing:
         existing_storage = StorageType(existing['storage_type'])
         if (
-            (existing_storage in [StorageType.STANDARD_IA, StorageType.GLACIER_IR] and folder_storage_type in [StorageType.STANDARD_IA, StorageType.GLACIER_IR]) or
+            (existing_storage == StorageType.STANDARD and folder_storage_type == StorageType.STANDARD) or
+            (existing_storage == StorageType.GLACIER_IR and folder_storage_type == StorageType.GLACIER_IR) or
             (existing_storage == StorageType.DEEP_ARCHIVE and folder_storage_type == StorageType.DEEP_ARCHIVE)
         ):
             deduplicate = True
     public_token = folder.get("public_token")
     if deduplicate:
+        # Calculate billing size for deduplication case
+        thumbnail_size = 128 * 1024 if existing.get('thumbnail_s3_key') else 0
+        billing_size = calculate_total_billing_size(file_size, thumbnail_size)
+        
         # Reuse S3 key and thumbnail, create new DB record
         file_in_db = FileInDB(
             filename=file.filename,
@@ -166,6 +176,7 @@ async def upload_file(
             file_type=file_type,
             content_type=file.content_type,
             file_size=file_size,
+            billing_size=billing_size,
             folder_id=folder_id,
             owner_id=user_id,
             s3_key=existing['s3_key'],
@@ -184,6 +195,22 @@ async def upload_file(
                 {"_id": ObjectId(folder_id)},
                 {"$inc": {"file_count": 1}}
             )
+            # Track storage usage for deduplication case
+            if not deduplicate:  # Only track if it's not a duplicate
+                # Get thumbnail size from existing file
+                thumbnail_size = 0
+                if existing.get('thumbnail_s3_key'):
+                    # For deduplication, we need to estimate thumbnail size
+                    # Since we're reusing existing thumbnail, we'll use a default size
+                    thumbnail_size = 128 * 1024  # 128KB default for thumbnail
+                
+                await storage_tracking_service.update_user_storage_with_billing_size(
+                    user_id=user_id,
+                    file_size=file_size,
+                    thumbnail_size=thumbnail_size,
+                    storage_type=folder_storage_type,
+                    operation="upload"
+                )
             file_presigned_url = await s3_service.generate_presigned_url(existing['s3_key'], 3600)
             thumbnail_presigned_url = None
             if existing.get('thumbnail_s3_key'):
@@ -222,6 +249,9 @@ async def upload_file(
     s3_key = s3_service.generate_s3_key(user_id, folder_id, file.filename)
     s3_url = await s3_service.upload_streaming_file(file, s3_key, folder_storage_type)
     
+    # Calculate initial billing size (file only, thumbnail will be added later)
+    initial_billing_size = calculate_total_billing_size(file_size, 0)
+    
     # Create file record first to get file ID
     file_in_db = FileInDB(
         filename=file.filename,
@@ -229,6 +259,7 @@ async def upload_file(
         file_type=file_type,
         content_type=file.content_type,
         file_size=file_size,
+        billing_size=initial_billing_size,
         folder_id=folder_id,
         owner_id=user_id,
         s3_key=s3_key,
@@ -244,6 +275,15 @@ async def upload_file(
     
     result = await files_collection.insert_one(file_in_db.dict(by_alias=True))
     file_id = str(result.inserted_id)
+    
+    # Track storage usage for new upload (file only, thumbnail will be tracked separately)
+    await storage_tracking_service.update_user_storage_with_billing_size(
+        user_id=user_id,
+        file_size=file_size,
+        thumbnail_size=0,  # Thumbnail will be tracked when generated
+        storage_type=folder_storage_type,
+        operation="upload"
+    )
     
     # Generate thumbnail after S3 upload using the pre-read content
     thumbnail_s3_key = None
@@ -279,52 +319,54 @@ async def upload_file(
                 loop = asyncio.get_event_loop()
                 thumbnail_stream = await loop.run_in_executor(None, thumbnail_service.generate_video_thumbnail, video_stream)
                 
-                # Process video for description (save to temp file first)
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=f".{file_extension}", delete=False) as temp_video:
-                    temp_video.write(file_content)
-                    temp_video_path = temp_video.name
+                # COMMENTED OUT: Process video for description (save to temp file first)
+                # import tempfile
+                # with tempfile.NamedTemporaryFile(suffix=f".{file_extension}", delete=False) as temp_video:
+                #     temp_video.write(file_content)
+                #     temp_video_path = temp_video.name
+                # 
+                # try:
+                #     # Generate video description with transcription
+                #     video_description = await video_processor.process_video(temp_video_path)
+                #     
+                #     # Generate embedding and add to vector database
+                #     embedding_response = await openai_client.embeddings.create(
+                #         model=settings.OPENAI_EMBEDDING_MODEL,
+                #         input=video_description
+                #     )
+                #     video_vector = embedding_response.data[0].embedding
+                #     await vector_db.add(video_description, file_id, user_id, video_vector)
+                #     
+                #     # Store video description in main field, not metadata
+                #     metadata = {
+                #         'format': file_extension,
+                #         'content_type': file.content_type,
+                #         'size': file_size
+                #     }
+                #     
+                #     # Update the file record with video description
+                #     await files_collection.update_one(
+                #         {"_id": result.inserted_id},
+                #         {"$set": {"video_description": video_description}}
+                #     )
+                #     
+                # except Exception as e:
+                #     print(f"❌ Video processing failed for {file.filename}: {str(e)}")
+                #     import traceback
+                #     traceback.print_exc()
                 
-                try:
-                    # Generate video description with transcription
-                    video_description = await video_processor.process_video(temp_video_path)
-                    
-                    # Generate embedding and add to vector database
-                    embedding_response = await openai_client.embeddings.create(
-                        model=settings.OPENAI_EMBEDDING_MODEL,
-                        input=video_description
-                    )
-                    video_vector = embedding_response.data[0].embedding
-                    await vector_db.add(video_description, file_id, user_id, video_vector)
-                    
-                    # Store video description in main field, not metadata
-                    metadata = {
-                        'format': file_extension,
-                        'content_type': file.content_type,
-                        'size': file_size
-                    }
-                    
-                    # Update the file record with video description
-                    await files_collection.update_one(
-                        {"_id": result.inserted_id},
-                        {"$set": {"video_description": video_description}}
-                    )
-                    
-                except Exception as e:
-                    print(f"❌ Video processing failed for {file.filename}: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    metadata = {
-                        'format': file_extension,
-                        'content_type': file.content_type,
-                        'size': file_size
-                    }
-                finally:
-                    # Clean up temp file
-                    try:
-                        os.unlink(temp_video_path)
-                    except:
-                        pass
+                metadata = {
+                    'format': file_extension,
+                    'content_type': file.content_type,
+                    'size': file_size
+                }
+                # COMMENTED OUT: Clean up temp file (no temp file created now)
+                # finally:
+                #     # Clean up temp file
+                #     try:
+                #         os.unlink(temp_video_path)
+                #     except:
+                #         pass
             else:
                 thumbnail_stream = None
             
@@ -336,7 +378,17 @@ async def upload_file(
                 )
                 # Upload thumbnail to S3
                 await s3_service.upload_file(
-                    thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD_IA
+                    thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD
+                )
+                
+                # Track thumbnail storage usage (with minimum 128KB)
+                thumbnail_size = thumbnail_stream.tell() if thumbnail_stream else 0
+                thumbnail_billing_size = apply_minimum_file_size(thumbnail_size)
+                await storage_tracking_service.update_user_storage(
+                    user_id=user_id,
+                    size_bytes=thumbnail_billing_size,
+                    storage_type=StorageType.STANDARD,
+                    operation="upload"
                 )
             
             
@@ -457,41 +509,41 @@ async def generate_and_upload_thumbnail(file_id: str, s3_key: str, filename: str
                 loop = asyncio.get_event_loop()
                 thumbnail_stream = await loop.run_in_executor(None, thumbnail_service.generate_video_thumbnail, video_stream)
                 
-                # Process video for description
-                try:
-                    # Save video to temp file for processing
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=f".{file_extension}", delete=False) as temp_video:
-                        temp_video.write(file_obj.getvalue())
-                        temp_video_path = temp_video.name
-                    
-                    # Generate video description with transcription
-                    video_description = await video_processor.process_video(temp_video_path)
-                    
-                    # Generate embedding and add to vector database
-                    embedding_response = await openai_client.embeddings.create(
-                        model=settings.OPENAI_EMBEDDING_MODEL,
-                        input=video_description
-                    )
-                    video_vector = embedding_response.data[0].embedding
-                    await vector_db.add(video_description, str(file_id), user_id, video_vector)
-                    
-                    # Update file record with video description
-                    await files_collection.update_one(
-                        {"_id": ObjectId(file_id)},
-                        {"$set": {"video_description": video_description}}
-                    )
-                    
-                    # Clean up temp file
-                    try:
-                        os.unlink(temp_video_path)
-                    except:
-                        pass
-                        
-                except Exception as e:
-                    print(f"❌ Video processing failed for {filename}: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
+                # COMMENTED OUT: Process video for description
+                # try:
+                #     # Save video to temp file for processing
+                #     import tempfile
+                #     with tempfile.NamedTemporaryFile(suffix=f".{file_extension}", delete=False) as temp_video:
+                #         temp_video.write(file_obj.getvalue())
+                #         temp_video_path = temp_video.name
+                #     
+                #     # Generate video description with transcription
+                #     video_description = await video_processor.process_video(temp_video_path)
+                #     
+                #     # Generate embedding and add to vector database
+                #     embedding_response = await openai_client.embeddings.create(
+                #         model=settings.OPENAI_EMBEDDING_MODEL,
+                #         input=video_description
+                #     )
+                #     video_vector = embedding_response.data[0].embedding
+                #     await vector_db.add(video_description, str(file_id), user_id, video_vector)
+                #     
+                #     # Update file record with video description
+                #     await files_collection.update_one(
+                #         {"_id": ObjectId(file_id)},
+                #         {"$set": {"video_description": video_description}}
+                #     )
+                #     
+                #     # Clean up temp file
+                #     try:
+                #         os.unlink(temp_video_path)
+                #     except:
+                #         pass
+                #         
+                # except Exception as e:
+                #     print(f"❌ Video processing failed for {filename}: {str(e)}")
+                #     import traceback
+                #     traceback.print_exc()
                 
                 metadata = {
                     'format': file_extension,
@@ -501,14 +553,35 @@ async def generate_and_upload_thumbnail(file_id: str, s3_key: str, filename: str
             if thumbnail_stream:
                 # Ensure the thumbnail stream is properly positioned
                 thumbnail_stream.seek(0)
+                
+                # Get thumbnail size BEFORE uploading (since upload will consume the stream)
+                # Read the entire stream to get size, then reset position
+                thumbnail_data = thumbnail_stream.read()
+                thumbnail_size = len(thumbnail_data)
+                thumbnail_stream = io.BytesIO(thumbnail_data)
+                thumbnail_stream.seek(0)
+                
                 thumbnail_s3_key = s3_service.generate_s3_key(
                     user_id, folder_id, f"thumb_{filename}", "thumbnail"
                 )
                 await s3_service.upload_file(
-                    thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD_IA
+                    thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD
                 )
+                
+                # Track thumbnail storage usage (with minimum 128KB)
+                await storage_tracking_service.update_user_storage_with_billing_size(
+                    user_id=user_id,
+                    file_size=0,  # No additional file size
+                    thumbnail_size=thumbnail_size,
+                    storage_type=StorageType.STANDARD,
+                    operation="upload"
+                )
+                # Calculate new total billing size including thumbnail
+                new_billing_size = calculate_total_billing_size(file_size, thumbnail_size)
+                
                 update_data = {
                     "thumbnail_s3_key": thumbnail_s3_key,
+                    "billing_size": new_billing_size,
                     "metadata": metadata,
                     "face_references": calculated_faces
                 }
@@ -574,12 +647,17 @@ async def upload_complete(
     if existing:
         existing_storage = StorageType(existing['storage_type'])
         if (
-            (existing_storage in [StorageType.STANDARD_IA, StorageType.GLACIER_IR] and storage_type in [StorageType.STANDARD_IA, StorageType.GLACIER_IR]) or
+            (existing_storage == StorageType.STANDARD and storage_type == StorageType.STANDARD) or
+            (existing_storage == StorageType.GLACIER_IR and storage_type == StorageType.GLACIER_IR) or
             (existing_storage == StorageType.DEEP_ARCHIVE and storage_type == StorageType.DEEP_ARCHIVE)
         ):
             deduplicate = True
     public_token = folder.get("public_token")
     if deduplicate:
+        # Calculate billing size for deduplication case
+        thumbnail_size = 128 * 1024 if existing.get('thumbnail_s3_key') else 0
+        billing_size = calculate_total_billing_size(data.file_size, thumbnail_size)
+        
         # Reuse S3 key and thumbnail, create new DB record
         file_in_db = FileInDB(
             filename=data.filename,
@@ -587,6 +665,7 @@ async def upload_complete(
             file_type=file_type,
             content_type=data.content_type,
             file_size=data.file_size,
+            billing_size=billing_size,
             folder_id=data.folder_id,
             owner_id=user_id,
             s3_key=existing['s3_key'],
@@ -605,6 +684,22 @@ async def upload_complete(
                 {"_id": ObjectId(data.folder_id)},
                 {"$inc": {"file_count": 1}}
             )
+            # Track storage usage for deduplication case
+            if not deduplicate:  # Only track if it's not a duplicate
+                # Get thumbnail size from existing file
+                thumbnail_size = 0
+                if existing.get('thumbnail_s3_key'):
+                    # For deduplication, we need to estimate thumbnail size
+                    # Since we're reusing existing thumbnail, we'll use a default size
+                    thumbnail_size = 128 * 1024  # 128KB default for thumbnail
+                
+                await storage_tracking_service.update_user_storage_with_billing_size(
+                    user_id=user_id,
+                    file_size=data.file_size,
+                    thumbnail_size=thumbnail_size,
+                    storage_type=storage_type,
+                    operation="upload"
+                )
             file_presigned_url = await s3_service.generate_presigned_url(existing['s3_key'], 3600)
             thumbnail_presigned_url = None
             if existing.get('thumbnail_s3_key'):
@@ -625,6 +720,9 @@ async def upload_complete(
             )
         else:
             raise HTTPException(status_code=500, detail="Failed to save file record")
+    # Calculate initial billing size (file only, thumbnail will be added later)
+    initial_billing_size = calculate_total_billing_size(data.file_size, 0)
+    
     # 1. Create DB record with no thumbnail
     file_in_db = FileInDB(
         filename=data.filename,
@@ -632,6 +730,7 @@ async def upload_complete(
         file_type=file_type,
         content_type=data.content_type,
         file_size=data.file_size,
+        billing_size=initial_billing_size,
         folder_id=data.folder_id,
         owner_id=user_id,
         s3_key=data.s3_key,
@@ -649,6 +748,14 @@ async def upload_complete(
         await folders_collection.update_one(
             {"_id": ObjectId(data.folder_id)},
             {"$inc": {"file_count": 1}}
+        )
+        # Track storage usage for new upload (file only, thumbnail will be tracked separately)
+        await storage_tracking_service.update_user_storage_with_billing_size(
+            user_id=user_id,
+            file_size=data.file_size,
+            thumbnail_size=0,  # Thumbnail will be tracked when generated
+            storage_type=storage_type,
+            operation="upload"
         )
         # 2. Kick off background task for thumbnail
         background_tasks.add_task(
@@ -692,7 +799,7 @@ async def add_from_gdrive(
         return JSONResponse(status_code=400, content={"success": False, "message": "Google Drive folder is not public."})
 
     # 2. Validate storage type
-    storage_type = data.folder_storage_type or FolderStorageType.GLACIER_IR.value
+    storage_type = data.folder_storage_type or StorageType.GLACIER_IR.value
     valid_types = {t.value for t in StorageType}
     if storage_type not in valid_types:
         return JSONResponse(status_code=400, content={"success": False, "message": f"Invalid folder_storage_type. Must be one of: {', '.join(valid_types)}"})
@@ -734,7 +841,7 @@ async def get_files_in_folder(
     sort_by: str = Query("filename", description="Field to sort by: filename, file_size, created_at, updated_at, file_type"),
     sort_order: str = Query("asc", description="Sort order: asc or desc"),
     file_type: Optional[FileType] = Query(None, description="Filter by file type: IMAGE, VIDEO, DOCUMENT, OTHER"),
-    storage_type: Optional[str] = Query(None, description="Filter by storage type: STANDARD, STANDARD_IA, GLACIER_IR, DEEP_ARCHIVE"),
+    storage_type: Optional[str] = Query(None, description="Filter by storage type: STANDARD, DEEP_ARCHIVE"),
     min_size: Optional[int] = Query(None, description="Minimum file size in bytes"),
     max_size: Optional[int] = Query(None, description="Maximum file size in bytes"),
     user_id: str = Depends(folder_read_access),
@@ -747,7 +854,7 @@ async def get_files_in_folder(
         user_id = None
     
     # Build query
-    query = {"folder_id": folder_id}
+    query = {"folder_id": folder_id, "deleted": {"$ne": True}}
     
     # Add search filter
     if search:
@@ -837,6 +944,124 @@ async def get_files_in_folder(
     )
 
 
+@router.get("/trash", response_model=PaginatedDeletedFilesResponse)
+async def get_deleted_files(
+    search: Optional[str] = Query(None, description="Search by filename"),
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    per_page: int = Query(20, ge=1, le=100, description="Number of files per page"),
+    sort_by: str = Query("deleted_at", description="Field to sort by: filename, file_size, created_at, deleted_at, file_type"),
+    sort_order: str = Query("desc", description="Sort order: asc or desc"),
+    file_type: Optional[FileType] = Query(None, description="Filter by file type: IMAGE, VIDEO, DOCUMENT, OTHER"),
+    storage_type: Optional[str] = Query(None, description="Filter by storage type: STANDARD, DEEP_ARCHIVE"),
+    min_size: Optional[int] = Query(None, description="Minimum file size in bytes"),
+    max_size: Optional[int] = Query(None, description="Maximum file size in bytes"),
+    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user)
+):
+    """Get all deleted files for the current user with parent folder information"""
+    files_collection = await get_files_collection()
+    folders_collection = await get_folders_collection()
+    
+    # Build query for deleted files owned by the user
+    query = {"owner_id": user_id, "deleted": True}
+    
+    # Add search filter
+    if search:
+        search_pattern = {"$regex": search, "$options": "i"}
+        query["$or"] = [
+            {"filename": search_pattern},
+            {"original_filename": search_pattern}
+        ]
+    
+    # Add file type filter
+    if file_type:
+        query["file_type"] = file_type.value
+    
+    # Add storage type filter
+    if storage_type:
+        query["storage_type"] = storage_type
+    
+    # Add file size filters
+    if min_size is not None or max_size is not None:
+        size_filter = {}
+        if min_size is not None:
+            size_filter["$gte"] = min_size
+        if max_size is not None:
+            size_filter["$lte"] = max_size
+        query["file_size"] = size_filter
+    
+    # Validate and set sort parameters
+    allowed_sort_fields = ["filename", "file_size", "created_at", "deleted_at", "file_type", "original_filename"]
+    if sort_by not in allowed_sort_fields:
+        sort_by = "deleted_at"
+    
+    sort_direction = 1 if sort_order.lower() == "asc" else -1
+    
+    # Get total count for pagination metadata
+    total_count = await files_collection.count_documents(query)
+    
+    # Calculate pagination metadata
+    pagination_meta = calculate_pagination_metadata(total_count, page, per_page)
+    
+    # Calculate skip for database query
+    skip = calculate_skip_from_page(page, per_page)
+    
+    # Get deleted files with pagination and sorting
+    cursor = files_collection.find(query).skip(skip).limit(per_page).sort(sort_by, sort_direction)
+    files = await cursor.to_list(None)
+    
+    # Get folder information for all files
+    folder_ids = list(set(file_doc["folder_id"] for file_doc in files))
+    folders = {}
+    if folder_ids:
+        folder_cursor = folders_collection.find({"_id": {"$in": [ObjectId(fid) for fid in folder_ids]}})
+        folder_docs = await folder_cursor.to_list(None)
+        folders = {str(folder["_id"]): folder["name"] for folder in folder_docs}
+    
+    # Convert to response format with fresh presigned URLs and folder names
+    result = []
+    tasks = []
+    
+    for file_doc in files:
+        file_doc["_id"] = str(file_doc["_id"])
+        file_doc["folder_name"] = folders.get(file_doc["folder_id"], "Unknown Folder")
+        
+        # Create tasks for parallel presigned URL generation
+        if file_doc.get("s3_key"):
+            tasks.append(s3_service.generate_presigned_url(file_doc["s3_key"], 3600))
+        else:
+            tasks.append(None)
+            
+        if file_doc.get("thumbnail_s3_key"):
+            tasks.append(s3_service.generate_presigned_url(file_doc["thumbnail_s3_key"], 3600))
+        else:
+            tasks.append(None)
+        
+        result.append(file_doc)
+    
+    # Execute all S3 calls in parallel
+    if tasks:
+        presigned_urls = await asyncio.gather(*[task for task in tasks if task is not None])
+        
+        # Assign results back to files
+        url_index = 0
+        for file_doc in result:
+            if file_doc.get("s3_key"):
+                file_doc["s3_url"] = presigned_urls[url_index]
+                url_index += 1
+            if file_doc.get("thumbnail_s3_key"):
+                file_doc["thumbnail_s3_url"] = presigned_urls[url_index]
+                url_index += 1
+    
+    # Convert to DeletedFileResponse objects
+    deleted_file_objects = [DeletedFileResponse(**file_doc) for file_doc in result]
+    
+    return PaginatedDeletedFilesResponse(
+        data=deleted_file_objects,
+        meta=pagination_meta
+    )
+
+
 @router.get("/{file_id}", response_model=File)
 async def get_file(
     file_id: str,
@@ -846,7 +1071,7 @@ async def get_file(
     """Get a specific file"""
     files_collection = await get_files_collection()
     
-    file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
+    file_doc = await files_collection.find_one({"_id": ObjectId(file_id), "deleted": {"$ne": True}})
     if not file_doc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1028,14 +1253,20 @@ async def update_file(
             await s3_service.change_storage_class(file_doc["s3_key"], target_storage_type)
             update_data["storage_type"] = target_storage_type.value
             
-            # Handle thumbnails based on storage type change
+            # Track storage usage change when moving file between storage types
+            await storage_tracking_service.move_storage_usage(
+                user_id=user_id,
+                size_bytes=file_doc.get("file_size", 0),
+                from_storage=current_storage_type,
+                to_storage=target_storage_type
+            )
+            
+            # Handle archival status based on storage type change
             if (target_storage_type == StorageType.DEEP_ARCHIVE and 
-                current_storage_type != StorageType.DEEP_ARCHIVE and 
-                file_doc.get("thumbnail_s3_key")):
-                # Keep thumbnail but remove references from database for consistency
-                # (Thumbnail will remain in S3 but won't be accessible via API)
-                update_data["thumbnail_s3_key"] = None
-                update_data["thumbnail_s3_url"] = None
+                current_storage_type != StorageType.DEEP_ARCHIVE):
+                # Update archival status but keep thumbnail references
+                update_data["archival_status"] = ArchivalStatus.DEEP_ARCHIVE.value
+                update_data["archived_at"] = datetime.now(timezone.utc)
         
         update_data["folder_id"] = file_update.folder_id
         
@@ -1206,36 +1437,58 @@ async def delete_file(
     # Check access to the folder containing this file
     await verify_folder_access(file_doc["folder_id"], user_id, AccessLevel.WRITE)
     
-    # Check if this file has duplicates (same file_hash)
-    file_hash = file_doc.get("file_hash")
-    should_delete_s3 = True
-    should_delete_thumbnail_s3 = True
+    # Soft delete: mark file as deleted instead of actually deleting
+    from datetime import datetime, timezone
+    await files_collection.update_one(
+        {"_id": ObjectId(file_id)},
+        {
+            "$set": {
+                "deleted": True,
+                "deleted_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc)
+            }
+        }
+    )
     
-    if file_hash:
-        # Count how many files have the same hash
-        duplicate_count = await files_collection.count_documents({"file_hash": file_hash})
+    # Update storage tracking for soft deletion
+    file_size = file_doc.get("file_size", 0)
+    storage_type = StorageType(file_doc.get("storage_type", StorageType.GLACIER_IR))
+    
+    # Use stored billing size if available, otherwise calculate it
+    if file_doc.get("billing_size"):
+        # Use the stored billing size directly
+        total_billing_size = file_doc["billing_size"]
+        await storage_tracking_service.update_user_storage(
+            user_id=user_id,
+            size_bytes=-total_billing_size,  # Negative for deletion
+            storage_type=storage_type,
+            operation="delete"
+        )
         
-        if duplicate_count > 1:
-            # There are other files with the same hash, don't delete from S3
-            should_delete_s3 = False
-            should_delete_thumbnail_s3 = False
-            print(f"📁 File {file_id} has {duplicate_count} duplicates, keeping S3 objects")
-        else:
-            # This is the only file with this hash, safe to delete from S3
-            print(f"🗑️  File {file_id} is unique, deleting from S3")
-    
-    # Clean up faces and vector database before deleting file
-    await cleanup_faces_and_vector_db(file_id, user_id)
-    
-    # Delete file from S3 only if it's the only copy
-    if should_delete_s3 and file_doc.get("s3_key"):
-        await s3_service.delete_file(file_doc["s3_key"])
-    
-    if should_delete_thumbnail_s3 and file_doc.get("thumbnail_s3_key"):
-        await s3_service.delete_file(file_doc["thumbnail_s3_key"])
-    
-    # Delete file record from database
-    await files_collection.delete_one({"_id": ObjectId(file_id)})
+        # Also update the deleted storage tracking
+        if storage_type == StorageType.DEEP_ARCHIVE:
+            active_field = "storage_used_archived"
+            deleted_field = "storage_used_archived_deleted"
+        else:  # STANDARD
+            active_field = "storage_used_standard"
+            deleted_field = "storage_used_standard_deleted"
+        
+        users_collection = await get_users_collection()
+        await users_collection.update_one(
+            {"_id": user_id},
+            {
+                "$inc": {
+                    deleted_field: total_billing_size
+                }
+            }
+        )
+    else:
+        # Fallback to calculation if billing_size is not stored
+        thumbnail_size = 0
+        if file_doc.get("thumbnail_s3_key"):
+            thumbnail_size = 128 * 1024
+        
+        await storage_tracking_service.soft_delete_file(user_id, file_size, thumbnail_size, storage_type)
     
     # Update folder's file count
     await folders_collection.update_one(
@@ -1244,6 +1497,64 @@ async def delete_file(
     )
     
     return FileDeleteResponse(message="File deleted successfully") 
+
+
+@router.post("/{file_id}/make-public")
+async def make_file_public(
+    file_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Make a single file public and generate a public token (owner/admin only)"""
+    files_collection = await get_files_collection()
+    file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
+    if not file_doc:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Check if user owns the file or is admin
+    if file_doc["owner_id"] != current_user.id and current_user.user_role != UserRole.super_admin:
+        raise HTTPException(status_code=403, detail="Not authorized to make this file public")
+    
+    # Generate a new public token for this file
+    public_token = str(uuid4())
+    
+    # Update the file with public token
+    await files_collection.update_one(
+        {"_id": ObjectId(file_id)},
+        {"$set": {"public_token": public_token}}
+    )
+    
+    return {"message": "File is now public", "public_token": public_token}
+
+
+@router.post("/{file_id}/make-private")
+async def make_file_private(
+    file_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Make a single file private by removing its public token (owner/admin only)"""
+    files_collection = await get_files_collection()
+    file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
+    if not file_doc:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Check if user owns the file or is admin
+    if file_doc["owner_id"] != current_user.id and current_user.user_role != UserRole.super_admin:
+        raise HTTPException(status_code=403, detail="Not authorized to make this file private")
+    
+    # Check if file is in a public folder - if so, can't make individual file private
+    folders_collection = await get_folders_collection()
+    folder = await folders_collection.find_one({"_id": ObjectId(file_doc["folder_id"])})
+    if folder and folder.get("is_public"):
+        return {"success": False, "reason": "File is in a public folder. Cannot make individual file private."}
+    
+    # Remove the public token
+    await files_collection.update_one(
+        {"_id": ObjectId(file_id)},
+        {"$set": {"public_token": None}}
+    )
+    
+    return {"message": "File is now private"}
+
 
 public_router = APIRouter(prefix="/public/files", tags=["Public Files"])
 
@@ -1257,16 +1568,17 @@ async def get_files_in_public_folder_by_id(
     sort_by: str = Query("filename", description="Field to sort by: filename, file_size, created_at, updated_at, file_type"),
     sort_order: str = Query("asc", description="Sort order: asc or desc"),
     file_type: Optional[FileType] = Query(None, description="Filter by file type: IMAGE, VIDEO, DOCUMENT, OTHER"),
-    storage_type: Optional[str] = Query(None, description="Filter by storage type: STANDARD, STANDARD_IA, GLACIER_IR, DEEP_ARCHIVE"),
+    storage_type: Optional[str] = Query(None, description="Filter by storage type: STANDARD, DEEP_ARCHIVE"),
     min_size: Optional[int] = Query(None, description="Minimum file size in bytes"),
-    max_size: Optional[int] = Query(None, description="Maximum file size in bytes")
+    max_size: Optional[int] = Query(None, description="Maximum file size in bytes"),
+    verify_public_token: dict = Depends(verify_public_token)
 ):
     folders_collection = await get_folders_collection()
     folder = await folders_collection.find_one({"_id": ObjectId(folder_id), "is_public": True, "public_token": token})
     if not folder:
         raise HTTPException(status_code=404, detail="Public folder not found or not public")
     files_collection = await get_files_collection()
-    query = {"folder_id": folder_id}
+    query = {"folder_id": folder_id, "deleted": {"$ne": True}}
     if search:
         search_pattern = {"$regex": search, "$options": "i"}
         query["$or"] = [
@@ -1323,10 +1635,10 @@ async def get_files_in_public_folder_by_id(
     )
 
 @public_router.get("/file", response_model=File)
-async def get_public_file_by_id(token: str, file_id: str):
+async def get_public_file_by_id(token: str, file_id: str, verify_public_token: dict = Depends(verify_public_token)):
     folders_collection = await get_folders_collection()
     files_collection = await get_files_collection()
-    file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
+    file_doc = await files_collection.find_one({"_id": ObjectId(file_id), "deleted": {"$ne": True}})
     if not file_doc:
         raise HTTPException(status_code=404, detail="File not found")
     folder = await folders_collection.find_one({"_id": ObjectId(file_doc["folder_id"]), "is_public": True, "public_token": token})
@@ -1339,6 +1651,80 @@ async def get_public_file_by_id(token: str, file_id: str):
         file_doc["thumbnail_s3_url"] = await s3_service.generate_presigned_url(file_doc["thumbnail_s3_key"], 3600)
     return File(**file_doc)
 
+
+@public_router.get("/{public_token}", response_model=File)
+async def get_public_file_by_token(public_token: str, verify_public_token: dict = Depends(verify_public_token)):
+    """Get a public file by its public token (no auth required)"""
+    files_collection = await get_files_collection()
+    file_doc = await files_collection.find_one({"public_token": public_token, "deleted": {"$ne": True}})
+    if not file_doc:
+        raise HTTPException(status_code=404, detail="Public file not found or not public")
+    
+    file_doc["_id"] = str(file_doc["_id"])
+    
+    # Generate fresh presigned URLs
+    if file_doc.get("s3_key"):
+        file_doc["s3_url"] = await s3_service.generate_presigned_url(file_doc["s3_key"], 3600)
+    
+    if file_doc.get("thumbnail_s3_key"):
+        file_doc["thumbnail_s3_url"] = await s3_service.generate_presigned_url(file_doc["thumbnail_s3_key"], 3600)
+    
+    return File(**file_doc)
+
+
+@public_router.get("/{public_token}/download", response_model=FileDownloadResponse)
+async def download_public_file(public_token: str, verify_public_token: dict = Depends(verify_public_token)):
+    """Get a presigned URL to download a public file using its token (no auth required)"""
+    files_collection = await get_files_collection()
+    
+    file_doc = await files_collection.find_one({"public_token": public_token})
+    if not file_doc:
+        raise HTTPException(status_code=404, detail="Public file not found or not public")
+    
+    # Check if file is in Deep Archive (needs restoration)
+    if file_doc.get("storage_type") == StorageType.DEEP_ARCHIVE.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File is in Deep Archive storage. Please restore it first (takes 12+ hours)."
+        )
+    
+    # Generate presigned URL (valid for 1 hour) with forced download
+    presigned_url = await s3_service.generate_download_presigned_url(file_doc["s3_key"], file_doc["filename"], 3600)
+    
+    if not presigned_url:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate download URL"
+        )
+    
+    return FileDownloadResponse(download_url=presigned_url, filename=file_doc["filename"])
+
+
+@public_router.get("/{public_token}/thumbnail", response_model=FileThumbnailResponse)
+async def get_public_file_thumbnail(public_token: str, verify_public_token: dict = Depends(verify_public_token)):
+    """Get a presigned URL for a public file's thumbnail using its token (no auth required)"""
+    files_collection = await get_files_collection()
+    
+    file_doc = await files_collection.find_one({"public_token": public_token})
+    if not file_doc:
+        raise HTTPException(status_code=404, detail="Public file not found or not public")
+    
+    if not file_doc.get("thumbnail_s3_key"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Thumbnail not available for this file"
+        )
+    
+    # Generate presigned URL for thumbnail (valid for 1 hour)
+    presigned_url = await s3_service.generate_presigned_url(file_doc["thumbnail_s3_key"], 3600)
+    
+    if not presigned_url:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate thumbnail URL"
+        )
+    
+    return FileThumbnailResponse(thumbnail_url=presigned_url)
 
 
 @public_router.get('/unlabeled/')
@@ -1406,6 +1792,260 @@ async def label_face(face_id: str, name: str, user_id: str = Depends(get_current
 
 
 # Register the public router
-router.include_router(public_router) 
+router.include_router(public_router)
+
+
+@router.post("/{file_id}/restore", response_model=RestoreFileResponse)
+async def restore_deleted_file(
+    file_id: str,
+    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user)
+):
+    """Restore a soft-deleted file by setting deleted=False"""
+    files_collection = await get_files_collection()
+    folders_collection = await get_folders_collection()
+    
+    file_doc = await files_collection.find_one({"_id": ObjectId(file_id), "deleted": True})
+    if not file_doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Deleted file not found"
+        )
+    
+    # Check if user owns the file
+    if file_doc["owner_id"] != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to restore this file"
+        )
+    
+    # Check if the parent folder exists and restore it if it's deleted
+    folder = await folders_collection.find_one({"_id": ObjectId(file_doc["folder_id"])})
+    if not folder:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Parent folder no longer exists. Cannot restore file."
+        )
+    
+    # Check if the parent folder is deleted and restore it (including nested parents)
+    folder_restored = False
+    restored_folders = []
+    current_folder_id = file_doc["folder_id"]
+    
+    while current_folder_id:
+        current_folder = await folders_collection.find_one({"_id": ObjectId(current_folder_id)})
+        if not current_folder:
+            break
+            
+        if current_folder.get("deleted", False):
+            # Check if user owns the folder
+            if current_folder["owner_id"] != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Not authorized to restore parent folder: {current_folder['name']}"
+                )
+            
+            # Restore the folder
+            from datetime import datetime, timezone
+            await folders_collection.update_one(
+                {"_id": ObjectId(current_folder_id)},
+                {
+                    "$set": {
+                        "deleted": False,
+                        "deleted_at": None,
+                        "updated_at": datetime.now(timezone.utc)
+                    }
+                }
+            )
+            restored_folders.append(current_folder["name"])
+            folder_restored = True
+            print(f"📁 Restored parent folder: {current_folder['name']} ({current_folder_id})")
+            
+            # Move up to the next parent folder
+            current_folder_id = current_folder.get("parent_folder_id")
+        else:
+            # Folder is not deleted, stop checking parents
+            break
+    
+    # Restore the file
+    from datetime import datetime, timezone
+    await files_collection.update_one(
+        {"_id": ObjectId(file_id)},
+        {
+            "$set": {
+                "deleted": False,
+                "deleted_at": None,
+                "updated_at": datetime.now(timezone.utc)
+            }
+        }
+    )
+    
+    # Update storage tracking for restoration
+    file_size = file_doc.get("file_size", 0)
+    storage_type = StorageType(file_doc.get("storage_type", StorageType.GLACIER_IR))
+    
+    # Use stored billing size if available, otherwise calculate it
+    if file_doc.get("billing_size"):
+        # Use the stored billing size directly
+        total_billing_size = file_doc["billing_size"]
+        
+        # Move storage from deleted back to active tracking
+        if storage_type == StorageType.DEEP_ARCHIVE:
+            active_field = "storage_used_archived"
+            deleted_field = "storage_used_archived_deleted"
+        else:  # STANDARD
+            active_field = "storage_used_standard"
+            deleted_field = "storage_used_standard_deleted"
+        
+        users_collection = await get_users_collection()
+        await users_collection.update_one(
+            {"_id": user_id},
+            {
+                "$inc": {
+                    deleted_field: -total_billing_size,     # Subtract from deleted
+                    active_field: total_billing_size        # Add back to active
+                }
+            }
+        )
+    else:
+        # Fallback to calculation if billing_size is not stored
+        thumbnail_size = 0
+        if file_doc.get("thumbnail_s3_key"):
+            thumbnail_size = 128 * 1024
+        
+        await storage_tracking_service.restore_deleted_file(user_id, file_size, thumbnail_size, storage_type)
+    
+    # Update folder's file count
+    await folders_collection.update_one(
+        {"_id": ObjectId(file_doc["folder_id"])},
+        {"$inc": {"file_count": 1}}
+    )
+    
+    # Prepare response message
+    if folder_restored:
+        if len(restored_folders) == 1:
+            message = f"File and parent folder '{restored_folders[0]}' restored successfully"
+        else:
+            folder_list = "', '".join(restored_folders)
+            message = f"File and parent folders '{folder_list}' restored successfully"
+    else:
+        message = "File restored successfully"
+    
+    return RestoreFileResponse(
+        message=message,
+        file_id=file_id
+    )
+
+
+@router.delete("/{file_id}/permanent", response_model=FileDeleteResponse)
+async def permanently_delete_file(
+    file_id: str,
+    user_id: str = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user)
+):
+    """Permanently delete a file from database and S3 storage"""
+    files_collection = await get_files_collection()
+    folders_collection = await get_folders_collection()
+    
+    file_doc = await files_collection.find_one({"_id": ObjectId(file_id)})
+    if not file_doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found"
+        )
+    
+    # Check if user owns the file
+    if file_doc["owner_id"] != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to delete this file"
+        )
+    
+    # Check access to the folder containing this file
+    await verify_folder_access(file_doc["folder_id"], user_id, AccessLevel.WRITE)
+    
+    file_size = file_doc.get("file_size", 0)
+    storage_type = StorageType(file_doc.get("storage_type", StorageType.GLACIER_IR))
+    
+    # Determine which storage field to update based on whether file is deleted or active
+    if file_doc.get("deleted", False):
+        # File is soft-deleted, remove from deleted storage tracking
+        if storage_type == StorageType.DEEP_ARCHIVE:
+            storage_field = "storage_used_archived_deleted"
+        else:  # STANDARD
+            storage_field = "storage_used_standard_deleted"
+    else:
+        # File is active, remove from active storage tracking
+        if storage_type == StorageType.DEEP_ARCHIVE:
+            storage_field = "storage_used_archived"
+        else:  # STANDARD
+            storage_field = "storage_used_standard"
+    
+    # Delete from S3
+    try:
+        # Delete main file
+        if file_doc.get("s3_key"):
+            await s3_service.delete_file(file_doc["s3_key"])
+            print(f"🗑️  Deleted main file from S3: {file_doc['s3_key']}")
+        
+        # Delete thumbnail if exists
+        if file_doc.get("thumbnail_s3_key"):
+            await s3_service.delete_file(file_doc["thumbnail_s3_key"])
+            print(f"🗑️  Deleted thumbnail from S3: {file_doc['thumbnail_s3_key']}")
+            
+    except Exception as e:
+        print(f"⚠️  Error deleting from S3: {str(e)}")
+        # Continue with database deletion even if S3 deletion fails
+    
+    # Clean up faces and vector database
+    try:
+        await cleanup_faces_and_vector_db(file_id, user_id)
+    except Exception as e:
+        print(f"⚠️  Error cleaning up faces and vector DB: {str(e)}")
+    
+    # Delete from database
+    result = await files_collection.delete_one({"_id": ObjectId(file_id)})
+    
+    if result.deleted_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete file from database"
+        )
+    
+    # Use stored billing size if available, otherwise calculate it
+    thumbnail_size = 0  # Initialize thumbnail_size
+    if file_doc.get("billing_size"):
+        total_billing_size = file_doc["billing_size"]
+        # For logging purposes, estimate thumbnail size from billing size
+        if file_doc.get("thumbnail_s3_key"):
+            thumbnail_size = total_billing_size - apply_minimum_file_size(file_size)
+            if thumbnail_size < 0:
+                thumbnail_size = 0
+    else:
+        # Calculate total billing size for permanent deletion
+        if file_doc.get("thumbnail_s3_key"):
+            # For permanent deletion, we need to estimate thumbnail size since we don't store it in the file record
+            # We'll use a default size of 128KB for thumbnails
+            thumbnail_size = 128 * 1024
+        
+        total_billing_size = calculate_total_billing_size(file_size, thumbnail_size)
+    
+    # Update user storage tracking
+    users_collection = await get_users_collection()
+    await users_collection.update_one(
+        {"_id": user_id},
+        {"$inc": {storage_field: -total_billing_size}}
+    )
+    
+    print(f"📊 Storage tracking: Permanent delete - User {user_id}, {total_billing_size} bytes (file: {file_size}, thumbnail: {thumbnail_size}), {storage_type.value} -> removed from {storage_field}")
+    
+    # Update folder's file count only if file was not already soft-deleted
+    if not file_doc.get("deleted", False):
+        await folders_collection.update_one(
+            {"_id": ObjectId(file_doc["folder_id"])},
+            {"$inc": {"file_count": -1}}
+        )
+    
+    return FileDeleteResponse(message="File permanently deleted successfully")
 
 

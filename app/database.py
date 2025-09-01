@@ -17,6 +17,14 @@ db = Database()
 
 
 async def get_database():
+    if db.database is None:
+        print("Warning: Database not connected. Attempting to connect...")
+        try:
+            await connect_to_mongo()
+            return db.database
+        except Exception as e:
+            print(f"Error connecting to database: {e}")
+            return None
     return db.database
 
 async def connect_to_mongo():
@@ -61,4 +69,53 @@ async def get_refresh_tokens_collection():
 
 async def get_faces_collection():
     database = await get_database()
-    return database.faces 
+    return database.faces
+
+
+async def get_notifications_collection():
+    database = await get_database()
+    return database.notifications
+
+
+async def get_costs_collection():
+    database = await get_database()
+    return database.costs
+
+
+async def get_email_tracking_collection():
+    database = await get_database()
+    if database is None:
+        print("Warning: Database is None, cannot access email_tracking collection")
+        return None
+    
+    # This will create the collection if it doesn't exist
+    collection = database.email_tracking
+    
+    # Ensure the collection exists by trying to access it
+    try:
+        # This will create the collection if it doesn't exist
+        await collection.find_one({})
+        
+        # Create indexes for better performance
+        await collection.create_index([("email_type", 1), ("to_email", 1), ("user_name", 1), ("sent_at", -1)])
+        await collection.create_index([("to_email", 1), ("user_name", 1), ("email_type", 1)])
+        
+        return collection
+    except Exception as e:
+        print(f"Error accessing email_tracking collection: {e}")
+        return None
+
+
+async def ensure_email_tracking_collection():
+    """Ensure the email_tracking collection exists with proper indexes"""
+    try:
+        collection = await get_email_tracking_collection()
+        if collection is not None:
+            print("✓ Email tracking collection ready")
+            return True
+        else:
+            print("✗ Failed to create email tracking collection")
+            return False
+    except Exception as e:
+        print(f"Error ensuring email tracking collection: {e}")
+        return False 

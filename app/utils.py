@@ -99,31 +99,21 @@ async def apply_dynamic_folder_status(folder_doc: dict) -> dict:
     folder_doc["effective_storage_type"] = effective_storage.value
     
     # Add timing information for Deep Archive retrievals
-    if (folder_doc.get("deep_archive_retrieval_start") and 
-        folder_doc.get("deep_archive_retrieval_ready")):
-        
+    retrieval_expiry_date = folder_doc.get("retrieval_expiry_date")
+    
+    if retrieval_expiry_date:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
         
-        retrieval_start = folder_doc["deep_archive_retrieval_start"]
-        retrieval_ready = folder_doc["deep_archive_retrieval_ready"]
-        retrieval_expires = folder_doc.get("deep_archive_retrieval_expires")
-        
-        # Ensure all datetime objects are timezone-aware
-        if retrieval_start and retrieval_start.tzinfo is None:
-            retrieval_start = retrieval_start.replace(tzinfo=timezone.utc)
-        if retrieval_ready and retrieval_ready.tzinfo is None:
-            retrieval_ready = retrieval_ready.replace(tzinfo=timezone.utc)
-        if retrieval_expires and retrieval_expires.tzinfo is None:
-            retrieval_expires = retrieval_expires.replace(tzinfo=timezone.utc)
+        # Ensure datetime object is timezone-aware
+        if retrieval_expiry_date.tzinfo is None:
+            retrieval_expiry_date = retrieval_expiry_date.replace(tzinfo=timezone.utc)
         
         # Add helpful timing info
         folder_doc["retrieval_status"] = {
-            "is_retrieving": now < retrieval_ready if retrieval_ready else False,
-            "is_ready": (now >= retrieval_ready if retrieval_ready else False) and (retrieval_expires is None or now < retrieval_expires),
-            "is_expired": retrieval_expires is not None and now >= retrieval_expires,
-            "time_until_ready": max(0, (retrieval_ready - now).total_seconds()) if retrieval_ready and now < retrieval_ready else 0,
-            "time_until_expires": max(0, (retrieval_expires - now).total_seconds()) if retrieval_expires and now < retrieval_expires else None
+            "is_ready": now < retrieval_expiry_date,
+            "is_expired": now >= retrieval_expiry_date,
+            "time_until_expires": max(0, (retrieval_expiry_date - now).total_seconds()) if now < retrieval_expiry_date else None
         }
     
     return folder_doc

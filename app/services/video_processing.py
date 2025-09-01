@@ -16,30 +16,12 @@ logger = logging.getLogger(__name__)
 
 class VideoProcessor:
     def __init__(self):
-        self.frames_per_second = 1  # Extract 1 frame per second
-        self.frames_per_composite = 10  # Combine 10 frames into one composite image
-        self.composite_width = 1920  # Width of composite image
-        self.composite_height = 1080  # Height of composite image
+        self.target_frames = 60  # Target number of frames to extract
+        self.frame_width = 640  # Standard frame width
+        self.frame_height = 480  # Standard frame height
     
     async def process_video(self, video_path: str) -> str:
-        """
-        Process a video file and return a comprehensive description with transcription.
-        
-        Args:
-            video_path: Path to the video file
-            
-        Returns:
-            str: Final summary description of the video including transcription context
-        """
-        """
-        Process a video file and return a comprehensive description with transcription.
-        
-        Args:
-            video_path: Path to the video file
-            
-        Returns:
-            str: Final summary description of the video including transcription context
-        """
+
         try:
             logger.info(f"Starting video processing for: {video_path}")
             
@@ -62,23 +44,9 @@ class VideoProcessor:
             
             logger.info(f"Successfully extracted {len(frames)} frames")
             
-            # Step 2: Create composite images (10 frames per composite)
-            logger.info("Step 2: Creating composite images...")
-            composite_images = await self._create_composite_images(frames)
-            
-            if not composite_images:
-                logger.error("No composite images created")
-                return "Error: Could not create composite images from video frames."
-            
-            logger.info(f"Successfully created {len(composite_images)} composite images")
-            
-            # Step 3: Generate descriptions for each composite
-            logger.info("Step 3: Generating descriptions...")
-            descriptions = []
-            for i, composite_img in enumerate(composite_images):
-                logger.info(f"Processing composite {i+1}/{len(composite_images)}")
-                description = await self._get_composite_description(composite_img, i)
-                descriptions.append(description)
+            # Step 2: Generate descriptions for each frame (parallel processing)
+            logger.info("Step 2: Generating descriptions for individual frames...")
+            descriptions = await self._process_frames_parallel(frames)
             
             logger.info(f"Generated {len(descriptions)} descriptions")
             
@@ -116,7 +84,8 @@ class VideoProcessor:
     
     async def _extract_frames(self, video_path: str) -> List[np.ndarray]:
         """
-        Extract frames from video at 1 frame per second.
+        Extract frames from video with equal intervals, targeting 60 frames total.
+        If video is shorter, extract however many frames are available.
         
         Args:
             video_path: Path to the video file
@@ -139,61 +108,39 @@ class VideoProcessor:
             video_info = video_streams[0]
             duration = float(probe['format']['duration'])
             fps = eval(video_info['r_frame_rate'])
+            total_frames = int(duration * fps)
             
-            logger.info(f"Video info - Duration: {duration}s, FPS: {fps}, Resolution: {video_info['width']}x{video_info['height']}")
+            logger.info(f"Video info - Duration: {duration}s, FPS: {fps}, Total frames: {total_frames}, Resolution: {video_info['width']}x{video_info['height']}")
             
             # Check if duration is valid
             if duration <= 0:
                 logger.error("Invalid video duration")
                 return []
             
-            frames = []
-            frame_interval = 1.0  # 1 second intervals
+            # Calculate how many frames to extract and at what intervals
+            frames_to_extract = min(self.target_frames, total_frames)
             
-            # For very short videos, extract at least one frame
-            if duration < 1:
-                logger.info("Video is very short, extracting single frame")
-                frame_interval = 0
+            logger.info(f"Will extract {frames_to_extract} frames from video")
             
-            for timestamp in range(0, int(duration), int(frame_interval)):
-                try:
-                    logger.info(f"Extracting frame at {timestamp}s...")
-                    # Extract frame at specific timestamp
-                    out, _ = (
-                        ffmpeg
-                        .input(video_path, ss=timestamp)
-                        .output('pipe:', format='rawvideo', pix_fmt='rgb24', vframes=1)
-                        .run(capture_stdout=True, quiet=True)
+            # Use parallel subprocess approach for frame extraction
+            interval = duration / frames_to_extract
+            
+            try:
+                logger.info(f"Extracting {frames_to_extract} frames using parallel subprocess approach")
+                
+                # Create temporary directory for frames
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    # Extract frames in parallel using subprocess
+                    frames = await self._extract_frames_parallel_subprocess(
+                        video_path, temp_dir, frames_to_extract, interval
                     )
                     
-                    if not out:
-                        logger.warning(f"No frame data extracted at {timestamp}s")
-                        continue
-                    
-                    # Convert to numpy array
-                    frame = np.frombuffer(out, np.uint8)
-                    
-                    # Reshape based on video dimensions
-                    height = int(video_info['height'])
-                    width = int(video_info['width'])
-                    
-                    if len(frame) != height * width * 3:
-                        logger.warning(f"Frame size mismatch at {timestamp}s: expected {height * width * 3}, got {len(frame)}")
-                        continue
-                    
-                    frame = frame.reshape([height, width, 3])
-                    
-                    # Resize frame to standard size
-                    frame_img = Image.fromarray(frame)
-                    frame_img = frame_img.resize((640, 480), Image.Resampling.LANCZOS)
-                    frame_array = np.array(frame_img)
-                    
-                    frames.append(frame_array)
-                    logger.info(f"Successfully extracted frame at {timestamp}s")
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to extract frame at {timestamp}s: {str(e)}")
-                    continue
+                    logger.info(f"Successfully extracted {len(frames)} frames using parallel subprocess")
+                
+            except Exception as e:
+                logger.error(f"Error in parallel subprocess frame extraction: {str(e)}")
+                # Fallback to single frame extraction if batch fails
+                return await self._extract_frames_fallback(video_path, video_info, duration, frames_to_extract)
             
             logger.info(f"Extracted {len(frames)} frames from video")
             
@@ -209,96 +156,249 @@ class VideoProcessor:
             logger.error(f"Frame extraction traceback: {traceback.format_exc()}")
             return []
     
-    async def _create_composite_images(self, frames: List[np.ndarray]) -> List[bytes]:
+    async def _extract_frames_fallback(self, video_path: str, video_info: dict, duration: float, frames_to_extract: int) -> List[np.ndarray]:
         """
-        Create composite images by combining 10 frames side by side.
+        Fallback method to extract frames one by one if batch extraction fails.
+        
+        Args:
+            video_path: Path to the video file
+            video_info: Video information from ffprobe
+            duration: Video duration in seconds
+            frames_to_extract: Number of frames to extract
+            
+        Returns:
+            List of frame arrays
+        """
+        logger.info("Using fallback method for frame extraction")
+        
+        # Calculate timestamps for equally spaced frames
+        if frames_to_extract <= 1:
+            timestamps = [duration / 2]  # Middle of the video
+        else:
+            interval = duration / frames_to_extract
+            timestamps = [i * interval for i in range(frames_to_extract)]
+        
+        frames = []
+        
+        for i, timestamp in enumerate(timestamps):
+            try:
+                logger.info(f"Extracting frame {i+1}/{len(timestamps)} at {timestamp:.2f}s...")
+                # Extract frame at specific timestamp
+                out, _ = (
+                    ffmpeg
+                    .input(video_path, ss=timestamp)
+                    .output('pipe:', format='rawvideo', pix_fmt='rgb24', vframes=1)
+                    .run(capture_stdout=True, quiet=True)
+                )
+                
+                if not out:
+                    logger.warning(f"No frame data extracted at {timestamp:.2f}s")
+                    continue
+                
+                # Convert to numpy array
+                frame = np.frombuffer(out, np.uint8)
+                
+                # Reshape based on video dimensions
+                height = int(video_info['height'])
+                width = int(video_info['width'])
+                
+                if len(frame) != height * width * 3:
+                    logger.warning(f"Frame size mismatch at {timestamp:.2f}s: expected {height * width * 3}, got {len(frame)}")
+                    continue
+                
+                frame = frame.reshape([height, width, 3])
+                
+                # Resize frame to standard size
+                frame_img = Image.fromarray(frame)
+                frame_img = frame_img.resize((self.frame_width, self.frame_height), Image.Resampling.LANCZOS)
+                frame_array = np.array(frame_img)
+                
+                frames.append(frame_array)
+                logger.info(f"Successfully extracted frame {i+1} at {timestamp:.2f}s")
+                
+            except Exception as e:
+                logger.warning(f"Failed to extract frame at {timestamp:.2f}s: {str(e)}")
+                continue
+        
+        return frames
+    
+    async def _extract_frames_parallel_subprocess(self, video_path: str, temp_dir: str, frames_count: int, interval: float) -> List[np.ndarray]:
+        """
+        Extract frames using parallel subprocess calls for maximum speed.
+        
+        Args:
+            video_path: Path to the video file
+            temp_dir: Temporary directory for frame files
+            frames_count: Number of frames to extract
+            interval: Time interval between frames
+            
+        Returns:
+            List of frame arrays
+        """
+        import subprocess
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+        
+        async def extract_single_frame(frame_index: int) -> tuple:
+            """Extract a single frame using subprocess."""
+            ts = frame_index * interval
+            out_name = os.path.join(temp_dir, f"frame_{frame_index:03d}.jpg")
+            
+            def run_ffmpeg():
+                try:
+                    result = subprocess.run([
+                        "ffmpeg", "-ss", str(ts), "-i", video_path,
+                        "-frames:v", "1", "-q:v", "2", 
+                        "-s", f"{self.frame_width}x{self.frame_height}",  # Scale to target size
+                        out_name, "-y"  # overwrite
+                    ], capture_output=True, text=True, timeout=30)
+                    
+                    if result.returncode == 0 and os.path.exists(out_name):
+                        return frame_index, out_name, None
+                    else:
+                        return frame_index, None, f"FFmpeg failed: {result.stderr}"
+                        
+                except subprocess.TimeoutExpired:
+                    return frame_index, None, "FFmpeg timeout"
+                except Exception as e:
+                    return frame_index, None, f"Exception: {str(e)}"
+            
+            # Run subprocess in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                result = await loop.run_in_executor(executor, run_ffmpeg)
+                return result
+        
+        # Create tasks for all frames
+        logger.info(f"Starting parallel extraction of {frames_count} frames...")
+        tasks = [extract_single_frame(i) for i in range(frames_count)]
+        
+        # Process in batches to avoid overwhelming the system
+        batch_size = 20  # Process 20 frames at a time
+        frames = [None] * frames_count
+        
+        for batch_start in range(0, frames_count, batch_size):
+            batch_end = min(batch_start + batch_size, frames_count)
+            batch_tasks = tasks[batch_start:batch_end]
+            
+            logger.info(f"Processing extraction batch {batch_start//batch_size + 1}/{(frames_count + batch_size - 1)//batch_size} "
+                       f"(frames {batch_start + 1}-{batch_end})")
+            
+            # Execute batch in parallel
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            
+            # Process results
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    logger.error(f"Frame extraction exception: {str(result)}")
+                    continue
+                    
+                frame_index, frame_path, error = result
+                if error:
+                    logger.warning(f"Failed to extract frame {frame_index}: {error}")
+                    continue
+                    
+                if frame_path and os.path.exists(frame_path):
+                    try:
+                        # Load image and convert to numpy array
+                        frame_img = Image.open(frame_path)
+                        frame_array = np.array(frame_img)
+                        frames[frame_index] = frame_array
+                    except Exception as e:
+                        logger.warning(f"Failed to load frame {frame_index}: {str(e)}")
+            
+            logger.info(f"Completed extraction batch {batch_start//batch_size + 1}")
+        
+        # Filter out None values and return successful frames
+        successful_frames = [frame for frame in frames if frame is not None]
+        logger.info(f"Successfully extracted {len(successful_frames)} out of {frames_count} frames")
+        
+        return successful_frames
+    
+    async def _process_frames_parallel(self, frames: List[np.ndarray]) -> List[str]:
+        """
+        Process frames in parallel batches to speed up description generation.
         
         Args:
             frames: List of frame arrays
             
         Returns:
-            List of composite image bytes
+            List of descriptions for each frame
         """
-        composite_images = []
+        import asyncio
         
-        for i in range(0, len(frames), self.frames_per_composite):
-            batch = frames[i:i + self.frames_per_composite]
-            
-            if len(batch) < self.frames_per_composite:
-                # Pad with black frames if needed
-                while len(batch) < self.frames_per_composite:
-                    black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    batch.append(black_frame)
-            
-            # Create composite image
-            composite = await self._combine_frames_side_by_side(batch)
-            composite_images.append(composite)
+        batch_size = 20  # Process 20 frames at a time
+        descriptions = [None] * len(frames)  # Pre-allocate list to maintain order
         
-        logger.info(f"Created {len(composite_images)} composite images")
-        return composite_images
+        # Process frames in batches
+        for batch_start in range(0, len(frames), batch_size):
+            batch_end = min(batch_start + batch_size, len(frames))
+            batch_frames = frames[batch_start:batch_end]
+            
+            logger.info(f"Processing batch {batch_start//batch_size + 1}/{(len(frames) + batch_size - 1)//batch_size} "
+                       f"(frames {batch_start + 1}-{batch_end})")
+            
+            # Create tasks for this batch
+            tasks = []
+            for i, frame in enumerate(batch_frames):
+                frame_index = batch_start + i
+                task = self._get_frame_description(frame, frame_index)
+                tasks.append(task)
+            
+            # Execute batch in parallel
+            batch_descriptions = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Store results in correct positions
+            for i, description in enumerate(batch_descriptions):
+                frame_index = batch_start + i
+                if isinstance(description, Exception):
+                    logger.error(f"Error processing frame {frame_index + 1}: {str(description)}")
+                    descriptions[frame_index] = f"Error analyzing frame {frame_index + 1}: {str(description)}"
+                else:
+                    descriptions[frame_index] = description
+            
+            logger.info(f"Completed batch {batch_start//batch_size + 1}, processed {len(batch_descriptions)} frames")
+        
+        # Filter out None values (shouldn't happen, but just in case)
+        descriptions = [desc for desc in descriptions if desc is not None]
+        
+        return descriptions
     
-    async def _combine_frames_side_by_side(self, frames: List[np.ndarray]) -> bytes:
+    async def _get_frame_description(self, frame: np.ndarray, frame_index: int) -> str:
         """
-        Combine frames side by side into a single image.
+        Get description for an individual frame using Gemini Vision.
         
         Args:
-            frames: List of frame arrays
+            frame: Frame array
+            frame_index: Index of the frame
             
         Returns:
-            Composite image as bytes
-        """
-        # Resize all frames to fit in composite
-        frame_width = self.composite_width // len(frames)
-        frame_height = self.composite_height
-        
-        resized_frames = []
-        for frame in frames:
-            frame_img = Image.fromarray(frame)
-            frame_img = frame_img.resize((frame_width, frame_height), Image.Resampling.LANCZOS)
-            resized_frames.append(np.array(frame_img))
-        
-        # Combine frames horizontally
-        composite_array = np.hstack(resized_frames)
-        
-        # Convert to PIL Image and then to bytes
-        composite_img = Image.fromarray(composite_array)
-        img_bytes = io.BytesIO()
-        composite_img.save(img_bytes, format='JPEG', quality=85)
-        
-        return img_bytes.getvalue()
-    
-    async def _get_composite_description(self, composite_img_bytes: bytes, segment_index: int) -> str:
-        """
-        Get description for a composite image using Gemini Vision.
-        
-        Args:
-            composite_img_bytes: Composite image as bytes
-            segment_index: Index of the time segment
-            
-        Returns:
-            Description of the composite image
+            Description of the frame
         """
         try:
-            start_time = segment_index * self.frames_per_composite
-            end_time = (segment_index + 1) * self.frames_per_composite
+            # Convert frame to bytes
+            frame_img = Image.fromarray(frame)
+            img_byte_arr = io.BytesIO()
+            frame_img.save(img_byte_arr, format='JPEG', quality=85)
+            frame_bytes = img_byte_arr.getvalue()
             
-            prompt = f"""Analyze this composite image showing {self.frames_per_composite} frames from a video (seconds {start_time}-{end_time}).
-Each frame represents 1 second of video time, arranged from left to right.
+            prompt = f"""Analyze this frame from a video (frame {frame_index + 1}).
 
-Describe what you see in this video segment, including:
-- What is happening in the video
-- Any people, objects, or scenes visible
-- Changes or movements across the frames
-- Colors, lighting, and visual elements
-- Any text, logos, or brands visible
-- Activities or actions being performed
+            Describe what you see in this frame, including:
+            - What is happening in the scene
+            - Any people, objects, or scenes visible
+            - Colors, lighting, and visual elements
+            - Any text, logos, or brands visible
+            - Activities or actions being performed
+            - The setting or environment
 
-Focus on the overall narrative and key visual elements."""
+            Provide a concise but detailed description focusing on the key visual elements 
+            and what's happening in this moment of the video."""
             
             response = await gemini_image_vision(
                 model=settings.GEMINI_VISION_MODEL,
                 prompt=prompt,
-                img_bytes=composite_img_bytes
+                img_bytes=frame_bytes
             )
             
             # Extract description from response
@@ -312,17 +412,17 @@ Focus on the overall narrative and key visual elements."""
                     return str(response)
             else:
                 return str(response)
-            
+                
         except Exception as e:
-            logger.error(f"Error getting composite description: {str(e)}")
-            return f"Error analyzing video segment {segment_index}: {str(e)}"
+            logger.error(f"Error getting frame description for frame {frame_index}: {str(e)}")
+            return f"Error analyzing frame {frame_index + 1}: {str(e)}"
     
     async def _generate_final_summary(self, descriptions: List[str]) -> str:
         """
-        Generate a final summary of all video segments.
+        Generate a final summary of all frame descriptions.
         
         Args:
-            descriptions: List of descriptions for each video segment
+            descriptions: List of descriptions for each frame
             
         Returns:
             Final summary description
@@ -332,20 +432,22 @@ Focus on the overall narrative and key visual elements."""
                 return "No video content could be analyzed."
             
             # Limit descriptions to avoid token limits
-            max_descriptions = 5
+            max_descriptions = 10
             if len(descriptions) > max_descriptions:
-                descriptions = descriptions[:max_descriptions]
+                # Take evenly spaced descriptions to represent the whole video
+                step = len(descriptions) // max_descriptions
+                descriptions = [descriptions[i] for i in range(0, len(descriptions), step)][:max_descriptions]
             
             combined_descriptions = "\n\n".join([
-                f"Segment {i+1}: {desc}" for i, desc in enumerate(descriptions)
+                f"Frame {i+1}: {desc}" for i, desc in enumerate(descriptions)
             ])
             
-            prompt = f"""Analyze this video content and provide a concise summary in about 50 words.
+            prompt = f"""Analyze this video content based on individual frames and provide a concise summary in about 50 words.
 
-Video segments:
+Frame descriptions from the video:
 {combined_descriptions}
 
-Provide a clear, descriptive summary of what this video shows, including key subjects, activities, and visual elements."""
+Provide a clear, descriptive summary of what this video shows, including key subjects, activities, and visual elements. Focus on the overall story or content of the video."""
             
             response = await gemini_text(prompt=prompt, model=settings.GEMINI_VISION_MODEL)
             
@@ -371,3 +473,70 @@ Provide a clear, descriptive summary of what this video shows, including key sub
 
 # Global instance
 video_processor = VideoProcessor()
+
+import asyncio
+import time
+import psutil
+import os
+import threading
+import logging
+
+# Global peak tracker
+peak_mem = 0
+
+def monitor_memory(process: psutil.Process, interval: float = 0.1):
+    """Continuously track peak memory of process + children."""
+    global peak_mem
+    while process.is_running():
+        try:
+            # Current process memory
+            mem = process.memory_info().rss
+
+            # Add child processes (e.g., ffmpeg)
+            for child in process.children(recursive=True):
+                try:
+                    mem += child.memory_info().rss
+                except psutil.NoSuchProcess:
+                    pass
+
+            peak_mem = max(peak_mem, mem)
+        except psutil.NoSuchProcess:
+            break
+
+        time.sleep(interval)
+
+async def main():
+    global peak_mem
+    process = psutil.Process(os.getpid())
+
+    # Start background memory monitor
+    t = threading.Thread(target=monitor_memory, args=(process,), daemon=True)
+    t.start()
+
+    start_time = time.time()
+    start_mem = process.memory_info().rss
+
+    print(os.path.exists("/mnt/d/Github Repos/Vamory/Vamory-backend/temp_video.mp4"))
+
+    video_desc = await video_processor.process_video(
+        "/mnt/d/Github Repos/Vamory/Vamory-backend/temp_video.mp4"
+    )
+
+    end_time = time.time()
+    end_mem = process.memory_info().rss
+    elapsed_time = end_time - start_time
+    mem_used_mb = (end_mem - start_mem) / (1024 * 1024)
+    peak_used_mb = peak_mem / (1024 * 1024)
+
+    print(f"Total time: {elapsed_time:.2f} seconds")
+    print(f"RAM usage change: {mem_used_mb:.2f} MB")
+    print(f"Peak RAM usage: {peak_used_mb:.2f} MB")
+    print(video_desc)
+
+if __name__ == "__main__":
+    # Configure logging to show INFO level messages
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    asyncio.run(main())

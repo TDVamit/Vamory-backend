@@ -14,13 +14,13 @@ class FolderService:
         files_collection = await get_files_collection()
         folders_collection = await get_folders_collection()
         
-        # Calculate size of direct files in this folder
-        files_cursor = files_collection.find({"folder_id": folder_id})
+        # Calculate size of direct files in this folder (excluding deleted files)
+        files_cursor = files_collection.find({"folder_id": folder_id, "deleted": False})
         async for file_doc in files_cursor:
             total_size += file_doc.get("file_size", 0)
         
-        # Get all subfolders and calculate their sizes recursively
-        subfolders_cursor = folders_collection.find({"parent_folder_id": folder_id})
+        # Get all subfolders and calculate their sizes recursively (excluding deleted folders)
+        subfolders_cursor = folders_collection.find({"parent_folder_id": folder_id, "deleted": False})
         async for subfolder in subfolders_cursor:
             subfolder_size = await self.calculate_folder_size(str(subfolder["_id"]))
             total_size += subfolder_size
@@ -39,18 +39,18 @@ class FolderService:
         files_collection = await get_files_collection()
         folders_collection = await get_folders_collection()
         
-        # Count direct files
-        file_count = await files_collection.count_documents({"folder_id": folder_id})
+        # Count direct files (excluding deleted files)
+        file_count = await files_collection.count_documents({"folder_id": folder_id, "deleted": False})
         
-        # Count direct subfolders
-        subfolder_count = await folders_collection.count_documents({"parent_folder_id": folder_id})
+        # Count direct subfolders (excluding deleted folders)
+        subfolder_count = await folders_collection.count_documents({"parent_folder_id": folder_id, "deleted": False})
         
         # Calculate total size
         total_size = await self.calculate_folder_size(folder_id)
         
-        # Get file type breakdown
+        # Get file type breakdown (excluding deleted files)
         file_type_pipeline = [
-            {"$match": {"folder_id": folder_id}},
+            {"$match": {"folder_id": folder_id, "deleted": False}},
             {"$group": {
                 "_id": "$file_type",
                 "count": {"$sum": 1},

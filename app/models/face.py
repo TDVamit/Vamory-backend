@@ -86,11 +86,77 @@ class FaceNameUpdateResponse(BaseModel):
 
 class UnknownFacesResponse(BaseModel):
     """Response model for unknown faces"""
-    faces: List[Dict[str, Any]]
-    total_count: int
+    data: List[Dict[str, Any]] = Field(..., description="List of unknown faces")
+    meta: PaginationMetadata = Field(..., description="Pagination metadata")
 
 
 class PaginatedFacesResponse(BaseModel):
     """Paginated response for faces"""
     data: List[Face] = Field(..., description="List of faces")
     meta: PaginationMetadata = Field(..., description="Pagination metadata")
+
+
+class FaceFileReference(BaseModel):
+    """File reference for face response"""
+    file_id: str
+    filename: str
+    bbox: Dict[str, float]
+    s3_url: str
+    added_at: datetime
+
+
+class FaceDetailResponse(BaseModel):
+    """Response model for single face detail"""
+    face_id: str
+    name: Optional[str] = None
+    file_references: List[FaceFileReference]
+    created_at: datetime
+    updated_at: datetime
+
+
+class FaceSuggestion(BaseModel):
+    """Face suggestion with thumbnail for name search"""
+    face_id: str
+    name: Optional[str] = None
+    thumbnail_s3_url: str
+    thumbnail_bbox: Dict[str, float]
+    thumbnail_filename: str
+
+
+class FaceNameSuggestionResponse(BaseModel):
+    """Paginated response for face name suggestions"""
+    data: List[FaceSuggestion] = Field(..., description="List of face suggestions")
+    meta: PaginationMetadata = Field(..., description="Pagination metadata")
+
+
+class FaceThumbnail(BaseModel):
+    """Face with thumbnail for list responses"""
+    face_id: str
+    name: Optional[str] = None
+    thumbnail_s3_url: Optional[str] = None
+    thumbnail_bbox: Optional[Dict[str, float]] = None
+    thumbnail_filename: Optional[str] = None
+    total_file_references: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class PaginatedFaceThumbnailsResponse(BaseModel):
+    """Paginated response for faces with thumbnails"""
+    data: List[FaceThumbnail] = Field(..., description="List of faces with thumbnails")
+    meta: PaginationMetadata = Field(..., description="Pagination metadata")
+
+
+class FaceMergeRequest(BaseModel):
+    """Request model for merging faces"""
+    face_id: str = Field(..., description="Source face ID to merge from")
+    target_face_id: str = Field(..., description="Target face ID to merge into")
+
+
+class FaceMergeResponse(BaseModel):
+    """Response model for face merge operation"""
+    message: str
+    target_face_id: str
+    merged_face_id: str
+    total_file_references_moved: int
+    target_face_name: Optional[str] = None

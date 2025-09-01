@@ -8,18 +8,20 @@ from app.models.folder import (
     FolderAccessInDB, AccessLevel, FolderWithAccess, StorageType, StorageTypeChangeRequest,
     StorageTypeChangeResponse, DeleteFolderResponse, ShareFolderResponse, 
     RevokeFolderAccessResponse, FolderStatsResponse, FolderStatsFileType,
-    PaginatedFoldersResponse, FolderStatus, ConversionMode
+    PaginatedFoldersResponse, FolderStatus
 )
 from app.models.user import User, UserRole
-from app.models.file import FileType
-from app.dependencies import get_current_user, folder_read_access, folder_write_access, folder_admin_access, verify_folder_access
+from app.models.file import FileType, StorageType
+from app.dependencies import get_current_user, folder_read_access, folder_write_access, folder_admin_access, verify_folder_access, verify_public_token
 from app.database import (
     get_folders_collection, get_folder_access_collection, 
     get_users_collection, get_files_collection, get_faces_collection
 )
 from app.services.s3 import s3_service
+from app.services.storage_tracking import storage_tracking_service
 from app.services.folder import folder_service
 from app.services.vector_db import vector_db
+from app.services.mail_util import send_folder_shared_message
 from app.utils import (
     format_file_size, 
     calculate_pagination_metadata, 
@@ -28,6 +30,7 @@ from app.utils import (
     apply_dynamic_folder_status_batch,
     convert_objectid
 )
+from app.services.billing_utils import apply_minimum_file_size, calculate_total_billing_size
 from app.services.storage_conversion import storage_conversion_service
 import logging
 from app.routers.auth import deny_if_viewer
@@ -62,7 +65,7 @@ async def get_folder_shared_users(folder_ids: List[str]) -> Dict[str, List[str]]
     user_ids = list(set(record["user_id"] for record in access_records))
     
     # Batch lookup users
-    users_cursor = users_collection.find({"_id": {"$in": [ObjectId(uid) for uid in user_ids]}})
+    users_cursor = users_collection.find({"_id": {"$in": user_ids}})
     users = await users_cursor.to_list(None)
     user_emails_map = {str(user["_id"]): user["email"] for user in users}
     
@@ -86,14 +89,16 @@ async def get_folder_thumbnail(folder_id: str) -> Optional[str]:
     first_file_with_thumbnail = await files_collection.find_one({
         "folder_id": folder_id,
         "thumbnail_s3_key": {"$exists": True, "$ne": None, "$ne": ""},
-        "file_type": FileType.IMAGE.value
+        "file_type": FileType.IMAGE.value,
+        "deleted": False
     }, sort=[("created_at", 1)])  # Sort by creation date, oldest first
     
     # If no image with thumbnail found, try any file type with thumbnail
     if not first_file_with_thumbnail:
         first_file_with_thumbnail = await files_collection.find_one({
             "folder_id": folder_id,
-            "thumbnail_s3_key": {"$exists": True, "$ne": None, "$ne": ""}
+            "thumbnail_s3_key": {"$exists": True, "$ne": None, "$ne": ""},
+            "deleted": False
         }, sort=[("created_at", 1)])
     
     if first_file_with_thumbnail and first_file_with_thumbnail.get("thumbnail_s3_key"):
@@ -190,7 +195,7 @@ async def get_folders(
             
             # When filtering by parent, show ALL direct children of that folder
             # (regardless of ownership, since user has access to parent)
-            folder_query = {"parent_folder_id": parent_folder_id}
+            folder_query = {"parent_folder_id": parent_folder_id, "deleted": {"$ne": True}}
             
             # Still need to get shared access records for access level calculation
             shared_access_cursor = folder_access_collection.find({"user_id": current_user.id})
@@ -204,9 +209,12 @@ async def get_folders(
             
             # For root level, show owned OR shared folders
             folder_query = {
-                "$or": [
-                    {"owner_id": current_user.id},  # Owned folders
-                    {"_id": {"$in": [ObjectId(fid) for fid in shared_folder_ids]}}  # Shared folders
+                "$and": [
+                    {"deleted": {"$ne": True}},  # Not deleted
+                    {"$or": [
+                        {"owner_id": current_user.id},  # Owned folders
+                        {"_id": {"$in": [ObjectId(fid) for fid in shared_folder_ids]}}  # Shared folders
+                    ]}
                 ]
             }
         
@@ -248,7 +256,7 @@ async def get_folders(
         shared_folder_owner_ids = []
         for folder in folders:
             if folder["owner_id"] != current_user.id:
-                shared_folder_owner_ids.append(ObjectId(folder["owner_id"]))
+                shared_folder_owner_ids.append(folder["owner_id"])
         
         # Batch lookup users for shared folders
         users_collection = await get_users_collection()
@@ -339,16 +347,22 @@ async def get_root_folders(
         # Build query for root folders (owned OR shared)
         if current_user.user_role == UserRole.super_admin:
             folder_query = {
-                "$or": [
-                    {"parent_folder_id": None},
-                    {"_id": {"$in": [ObjectId(fid) for fid in shared_folder_ids]}}  # Shared folders
+                "$and": [
+                    {"deleted": {"$ne": True}},  # Not deleted
+                    {"$or": [
+                        {"parent_folder_id": None},
+                        {"_id": {"$in": [ObjectId(fid) for fid in shared_folder_ids]}}  # Shared folders
+                    ]}
                 ]
             }
         else:
             folder_query = {
-                "$or": [
-                    {"owner_id": current_user.id},  # Owned folders
-                    {"_id": {"$in": [ObjectId(fid) for fid in shared_folder_ids]}}  # Shared folders
+                "$and": [
+                    {"deleted": {"$ne": True}},  # Not deleted
+                    {"$or": [
+                        {"owner_id": current_user.id},  # Owned folders
+                        {"_id": {"$in": [ObjectId(fid) for fid in shared_folder_ids]}}  # Shared folders
+                    ]}
                 ]
             }
         
@@ -404,7 +418,7 @@ async def get_root_folders(
         shared_folder_owner_ids = []
         for folder in folders:
             if folder["owner_id"] != current_user.id:
-                shared_folder_owner_ids.append(ObjectId(folder["owner_id"]))
+                shared_folder_owner_ids.append(folder["owner_id"])
         
         # Batch lookup users for shared folders
         users_collection = await get_users_collection()
@@ -484,7 +498,7 @@ async def get_folder(
         folders_collection = await get_folders_collection()
         
         # Get folder
-        folder = await folders_collection.find_one({"_id": ObjectId(folder_id)})
+        folder = await folders_collection.find_one({"_id": ObjectId(folder_id), "deleted": {"$ne": True}})
         if not folder:
             raise HTTPException(status_code=404, detail="Folder not found")
         
@@ -568,7 +582,6 @@ async def change_folder_storage_type(
     new_storage_type: StorageType = Form(..., description="New storage type"),
     apply_to_children: bool = Form(False, description="Apply to all subfolders and files"),
     retrieval_days: Optional[int] = Form(None, ge=1, le=365, description="Days to retrieve from Deep Archive (1-365, None = permanent)"),
-    retrieval_mode: ConversionMode = Form(ConversionMode.BULK, description="Retrieval mode for Deep Archive"),
     user_id: str = Depends(folder_admin_access),
     current_user: User = Depends(get_current_user)
 ):
@@ -592,7 +605,6 @@ async def change_folder_storage_type(
         if new_storage_type == StorageType.DEEP_ARCHIVE:
             apply_to_children = True  # Force include children
             retrieval_days = None     # Not applicable for TO Deep Archive
-            retrieval_mode = ConversionMode.BULK  # Force bulk mode
         
         # Validate retrieval_days for FROM Deep Archive
         if current_storage == StorageType.DEEP_ARCHIVE and new_storage_type != StorageType.DEEP_ARCHIVE:
@@ -620,24 +632,18 @@ async def change_folder_storage_type(
                 folder_id=folder_id,
                 target_storage=new_storage_type,
                 apply_to_children=apply_to_children,
-                retrieval_days=retrieval_days,
-                retrieval_mode=retrieval_mode
+                retrieval_days=retrieval_days
             )
             
             return StorageTypeChangeResponse(
-                message=f"Started Deep Archive retrieval ({retrieval_mode.value} mode)",
+                message=f"Started Deep Archive retrieval",
                 folder_id=folder_id,
                 folders_updated=len(all_folder_ids),
                 files_updated=file_count,
                 thumbnails_deleted=0,
                 new_storage_type=new_storage_type.value,
                 new_status=FolderStatus.CONVERTING,
-                conversion_job_id=job_id,
-                estimated_completion_time=retrieval_ready,
-                is_immediate=False,
-                retrieval_days=retrieval_days,
-                retrieval_mode=retrieval_mode,
-                bulk_mode_savings=storage_conversion_service.get_cost_savings_info(retrieval_mode, file_count)
+                retrieval_days=retrieval_days
             )
         
         else:
@@ -660,12 +666,7 @@ async def change_folder_storage_type(
                 thumbnails_deleted=thumbnails_deleted,
                 new_storage_type=new_storage_type.value,
                 new_status=new_status,
-                conversion_job_id=job_id,
-                estimated_completion_time=None,
-                is_immediate=True,
-                retrieval_days=None,
-                retrieval_mode=None,
-                bulk_mode_savings=None
+                retrieval_days=None
             )
         
     except HTTPException:
@@ -699,17 +700,9 @@ async def get_conversion_status(
             "current_status": folder.get("status"),
             "storage_type": folder.get("storage_type"),
             "effective_storage_type": folder.get("effective_storage_type"),
-            "conversion_job_id": folder.get("conversion_job_id"),
-            "conversion_started_at": folder.get("conversion_started_at"),
-            "conversion_estimated_completion": folder.get("conversion_estimated_completion"),
-            "conversion_from_storage": folder.get("conversion_from_storage"),
-            "conversion_to_storage": folder.get("conversion_to_storage"),
             "retrieval_status": folder.get("retrieval_status"),
-            "deep_archive_retrieval_start": folder.get("deep_archive_retrieval_start"),
-            "deep_archive_retrieval_ready": folder.get("deep_archive_retrieval_ready"),
-            "deep_archive_retrieval_expires": folder.get("deep_archive_retrieval_expires"),
             "retrieval_days": folder.get("retrieval_days"),
-            "retrieval_mode": folder.get("retrieval_mode")
+            "retrieval_expiry_date": folder.get("retrieval_expiry_date")
         })
         
     except HTTPException:
@@ -797,56 +790,72 @@ async def delete_folder(
             traceback.print_exc()
 
     try:
+        from datetime import datetime, timezone
+        
         # Get all folder IDs to delete (including subfolders)
         folder_ids_to_delete = await get_all_subfolders(folder_id)
         
-        # Get all files in these folders
+        # Get all files that will be deleted for storage tracking
         files_to_delete = await files_collection.find({
-            "folder_id": {"$in": folder_ids_to_delete}
+            "folder_id": {"$in": folder_ids_to_delete}, 
+            "deleted": {"$ne": True}
         }).to_list(None)
         
-        # Extract file IDs for cleanup
-        file_ids_to_cleanup = [str(file_doc["_id"]) for file_doc in files_to_delete]
-        
-        # Delete files from S3 (only if not referenced elsewhere)
-        s3_keys_to_delete = set()
+        # Prepare files data for bulk storage tracking
+        files_data = []
         for file_doc in files_to_delete:
-            # Main file S3 key
-            s3_key = file_doc.get("s3_key")
-            if s3_key:
-                count = await files_collection.count_documents({"s3_key": s3_key})
-                if count == 1:
-                    s3_keys_to_delete.add(s3_key)
-            # Thumbnail S3 key
-            thumbnail_s3_key = file_doc.get("thumbnail_s3_key")
-            if thumbnail_s3_key:
-                count = await files_collection.count_documents({"thumbnail_s3_key": thumbnail_s3_key})
-                if count == 1:
-                    s3_keys_to_delete.add(thumbnail_s3_key)
+            # Use stored billing size if available, otherwise calculate it
+            if file_doc.get('billing_size'):
+                total_billing_size = file_doc['billing_size']
+                # For bulk operations, we need to split the billing size back to file and thumbnail
+                # This is an approximation since we don't store them separately
+                file_size = file_doc.get('file_size', 0)
+                thumbnail_size = total_billing_size - apply_minimum_file_size(file_size)
+                if thumbnail_size < 0:
+                    thumbnail_size = 0
+            else:
+                file_size = file_doc.get('file_size', 0)
+                thumbnail_size = 128 * 1024 if file_doc.get('thumbnail_s3_key') else 0
+            
+            files_data.append({
+                'file_size': file_size,
+                'thumbnail_size': thumbnail_size,
+                'storage_type': file_doc.get('storage_type', StorageType.STANDARD)
+            })
         
-        if s3_keys_to_delete:
-            delete_result = await s3_service.delete_files_batch(list(s3_keys_to_delete))
-            logger.info(f"Deleted {delete_result.get('deleted', 0)} files from S3 for folder {folder_id}")
+        # Soft delete all files in these folders
+        files_update_result = await files_collection.update_many(
+            {"folder_id": {"$in": folder_ids_to_delete}, "deleted": {"$ne": True}},
+            {
+                "$set": {
+                    "deleted": True,
+                    "deleted_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            }
+        )
         
-        # Clean up faces and vector database entries before deleting files
-        if file_ids_to_cleanup:
-            await bulk_cleanup_faces_and_vector_db(file_ids_to_cleanup, user_id)
+        # Update storage tracking for all deleted files
+        if files_data:
+            await storage_tracking_service.bulk_soft_delete_files(user_id, files_data)
         
-        # Delete files from database
-        files_delete_result = await files_collection.delete_many({
-            "folder_id": {"$in": folder_ids_to_delete}
-        })
+        # Clean up faces and vector database entries for all deleted files
+        if files_to_delete:
+            file_ids = [str(file_doc["_id"]) for file_doc in files_to_delete]
+            await bulk_cleanup_faces_and_vector_db(file_ids, user_id)
         
-        # Delete folder access records
-        await folder_access_collection.delete_many({
-            "folder_id": {"$in": folder_ids_to_delete}
-        })
-        
-        # Delete folders from database (convert to ObjectId)
+        # Soft delete all folders (convert to ObjectId)
         folder_object_ids = [ObjectId(fid) for fid in folder_ids_to_delete]
-        folders_delete_result = await folders_collection.delete_many({
-            "_id": {"$in": folder_object_ids}
-        })
+        folders_update_result = await folders_collection.update_many(
+            {"_id": {"$in": folder_object_ids}, "deleted": {"$ne": True}},
+            {
+                "$set": {
+                    "deleted": True,
+                    "deleted_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            }
+        )
         
         # Update parent folder's subfolder count if this folder had a parent
         parent_folder = await folders_collection.find_one({"_id": ObjectId(folder_id)})
@@ -856,8 +865,30 @@ async def delete_folder(
                 {"$inc": {"subfolder_count": -1}}
             )
         
+        # Update file count for all parent folders that need it
+        # Get all unique parent folder IDs from the deleted folders
+        parent_folder_ids = set()
+        for folder_id_str in folder_ids_to_delete:
+            folder_doc = await folders_collection.find_one({"_id": ObjectId(folder_id_str)})
+            if folder_doc and folder_doc.get("parent_folder_id"):
+                parent_folder_ids.add(folder_doc["parent_folder_id"])
+        
+        # Count files that were deleted from each parent folder
+        for parent_id in parent_folder_ids:
+            deleted_file_count = await files_collection.count_documents({
+                "folder_id": parent_id,
+                "deleted": True,
+                "deleted_at": {"$gte": datetime.now(timezone.utc)}
+            })
+            
+            if deleted_file_count > 0:
+                await folders_collection.update_one(
+                    {"_id": ObjectId(parent_id)},
+                    {"$inc": {"file_count": -deleted_file_count}}
+                )
+        
         return DeleteFolderResponse(
-            message=f"Successfully deleted folder and {files_delete_result.deleted_count} files"
+            message=f"Successfully deleted folder and {files_update_result.modified_count} files"
         )
         
     except Exception as e:
@@ -894,8 +925,7 @@ async def share_folder(
     
     # Find the user to share with
     user_to_share_with = await users_collection.find_one({
-        "email": share_request.user_email,
-        "is_active": True
+        "email": share_request.user_email
     })
     
     if not user_to_share_with:
@@ -931,7 +961,6 @@ async def share_folder(
         
         await folder_access_collection.insert_one(folder_access.dict(by_alias=True))
         
-        # Update folder's is_shared status
         await folders_collection.update_one(
             {"_id": ObjectId(folder_id)},
             {"$set": {"is_shared": True}}
@@ -939,6 +968,8 @@ async def share_folder(
         
         message = f"Folder shared with {share_request.access_level.value} access"
     
+    await send_folder_shared_message(folder.get("name", "unknown"), share_request.user_email, current_user.full_name)
+
     return ShareFolderResponse(
         message=message,
         user_email=share_request.user_email,
@@ -1025,9 +1056,9 @@ async def get_folder_statistics(
     # Get all files in folder and subfolders
     all_folder_ids = await storage_conversion_service._get_all_child_folders(folder_id)
     
-    # Aggregate file statistics
+    # Aggregate file statistics (excluding deleted files)
     pipeline = [
-        {"$match": {"folder_id": {"$in": all_folder_ids}}},
+        {"$match": {"folder_id": {"$in": all_folder_ids}, "deleted": False}},
         {"$group": {
             "_id": "$file_type",
             "count": {"$sum": 1},
@@ -1095,7 +1126,7 @@ async def get_folder_shared_with(
     # Get user details for each access record
     shared_with = []
     for access_record in access_records:
-        user = await users_collection.find_one({"_id": ObjectId(access_record["user_id"])})
+        user = await users_collection.find_one({"_id": access_record["user_id"]})
         if user:
             shared_with.append({
                 "user_id": str(user["_id"]),
@@ -1184,7 +1215,7 @@ async def get_folders_shared_with_me(
         shared_folder_owner_ids = []
         for folder in folders:
             if folder["owner_id"] != current_user.id:
-                shared_folder_owner_ids.append(ObjectId(folder["owner_id"]))
+                shared_folder_owner_ids.append(folder["owner_id"])
         
         # Batch lookup users for shared folders
         users_collection = await get_users_collection()
@@ -1262,21 +1293,16 @@ async def check_folder_conversion_status(
         folder = await folders_collection.find_one({"_id": ObjectId(folder_id)})
         if not folder:
             raise HTTPException(status_code=404, detail="Folder not found")
-        target_storage_str = folder.get("conversion_to_storage")
-        if not target_storage_str:
-            raise HTTPException(status_code=400, detail="Folder does not have a target conversion storage type (conversion_to_storage)")
-        from app.models.folder import StorageType
-        target_storage = StorageType(target_storage_str)
+        
+        # Apply dynamic status to get current effective storage type
+        folder = await apply_dynamic_folder_status(folder)
+        current_storage = StorageType(folder.get("effective_storage_type", folder.get("storage_type")))
+        
         result = await storage_conversion_service.check_and_update_folder_conversion_status(
             folder_id=folder_id,
-            target_storage=target_storage,
+            target_storage=current_storage,
             apply_to_children=True
         )
-        if not result.get("success"):
-            # Add estimated ready time if available
-            estimated_ready = folder.get("deep_archive_retrieval_ready")
-            if estimated_ready:
-                result["estimated_ready_time"] = estimated_ready
         return convert_objectid(result)
     except HTTPException:
         raise
@@ -1372,7 +1398,7 @@ async def make_folder_private(
 public_router = APIRouter(prefix="/public/folders", tags=["Public Folders"])
 
 @public_router.get("/{public_token}", response_model=Folder)
-async def get_public_folder(public_token: str):
+async def get_public_folder(public_token: str, verify_public_token: dict = Depends(verify_public_token)):
     """Get public folder info by token (no auth required)"""
     folders_collection = await get_folders_collection()
     folder = await folders_collection.find_one({"public_token": public_token, "is_public": True})
@@ -1382,7 +1408,7 @@ async def get_public_folder(public_token: str):
     return Folder(**folder)
 
 @public_router.get("/{public_token}/path/{folder_path:path}", response_model=Folder)
-async def get_public_folder_by_path(public_token: str, folder_path: str):
+async def get_public_folder_by_path(public_token: str, folder_path: str, verify_public_token: dict = Depends(verify_public_token)):
     """Get a public folder by path (e.g., /Photos/2024/Vacation)"""
     folders_collection = await get_folders_collection()
     # Find root folder by token
@@ -1414,7 +1440,8 @@ async def get_public_subfolders(
     token: str,
     folder_id: str,
     page: int = 1,
-    per_page: int = 20
+    per_page: int = 20,
+    verify_public_token: dict = Depends(verify_public_token)
 ):
     """Get paginated list of subfolders for a public folder by token and folder_id"""
     folders_collection = await get_folders_collection()
@@ -1423,10 +1450,10 @@ async def get_public_subfolders(
     if not parent_folder:
         raise HTTPException(status_code=404, detail="Public folder not found or not public")
     # Count total subfolders
-    total_count = await folders_collection.count_documents({"parent_folder_id": folder_id, "is_public": True, "public_token": token})
+    total_count = await folders_collection.count_documents({"parent_folder_id": folder_id, "is_public": True, "public_token": token, "deleted": {"$ne": True}})
     # Pagination
     skip = (page - 1) * per_page
-    cursor = folders_collection.find({"parent_folder_id": folder_id, "is_public": True, "public_token": token}).skip(skip).limit(per_page)
+    cursor = folders_collection.find({"parent_folder_id": folder_id, "is_public": True, "public_token": token, "deleted": {"$ne": True}}).skip(skip).limit(per_page)
     subfolders = await cursor.to_list(None)
     for subfolder in subfolders:
         subfolder["_id"] = str(subfolder["_id"])

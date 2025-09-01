@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.database import connect_to_mongo, close_mongo_connection
-from app.routers import auth, folders, files, faces, ai_search, credit
+from app.routers import auth, folders, files, faces, ai_search, credit, notifications
 from app.config import settings
 import tflite_runtime.interpreter as tflite
 import os
@@ -47,6 +47,7 @@ app.include_router(files.router, prefix="/api/v1")
 app.include_router(faces.router, prefix="/api/v1")
 app.include_router(ai_search.router, prefix="/api/v1")
 app.include_router(credit.router, prefix="/api/v1")
+app.include_router(notifications.router, prefix="/api/v1")
 
 
 @app.get("/")

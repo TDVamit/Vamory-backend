@@ -193,6 +193,107 @@ async def update_face_name(face_id, name, owner_id):
         return 0
 
 
+async def get_face_by_id(face_id, owner_id):
+    """Get a single face by its ID"""
+    try:
+        faces_coll = await get_faces_collection()
+        
+        face = await faces_coll.find_one(
+            {'_id': ObjectId(face_id), 'owner_id': owner_id},
+            {'embedding': 0}  # Exclude embedding from response
+        )
+        
+        return face
+    except Exception as e:
+        print("exception getting face by id:", str(e))
+        return None
+
+
+async def search_faces_by_name(owner_id, name_pattern, limit=20, skip=0):
+    """Search faces by name pattern with regex support"""
+    try:
+        faces_coll = await get_faces_collection()
+        
+        # Build search query - if name_pattern is provided, use regex search
+        query = {'owner_id': owner_id}
+        if name_pattern:
+            # Use case-insensitive regex search
+            query['name'] = {'$regex': name_pattern, '$options': 'i'}
+        else:
+            # If no pattern provided, get all named faces
+            query['name'] = {'$ne': None}
+        
+        # Get total count for pagination
+        total_count = await faces_coll.count_documents(query)
+        
+        # Get faces with pagination
+        faces = await faces_coll.find(
+            query,
+            {'embedding': 0}  # Exclude embedding from response
+        ).skip(skip).limit(limit).to_list(length=limit)
+        
+        return faces, total_count
+    except Exception as e:
+        print("exception searching faces by name:", str(e))
+        return [], 0
+
+
+async def merge_faces(face_id, target_face_id, owner_id):
+    """Merge source face into target face and delete source face"""
+    try:
+        faces_coll = await get_faces_collection()
+        
+        # Get both faces to verify ownership and existence
+        source_face = await faces_coll.find_one({
+            '_id': ObjectId(face_id),
+            'owner_id': owner_id
+        })
+        
+        target_face = await faces_coll.find_one({
+            '_id': ObjectId(target_face_id),
+            'owner_id': owner_id
+        })
+        
+        if not source_face:
+            return None, "Source face not found"
+        
+        if not target_face:
+            return None, "Target face not found"
+        
+        if face_id == target_face_id:
+            return None, "Cannot merge face with itself"
+        
+        # Get file references from source face
+        source_file_refs = source_face.get('file_references', [])
+        target_file_refs = target_face.get('file_references', [])
+        
+        # Merge file references (avoid duplicates)
+        existing_file_ids = {ref['file_id'] for ref in target_file_refs}
+        new_file_refs = [ref for ref in source_file_refs if ref['file_id'] not in existing_file_ids]
+        
+        # Update target face with merged file references
+        merged_file_refs = target_file_refs + new_file_refs
+        
+        await faces_coll.update_one(
+            {'_id': ObjectId(target_face_id)},
+            {
+                '$set': {
+                    'file_references': merged_file_refs,
+                    'updated_at': datetime.now(timezone.utc)
+                }
+            }
+        )
+        
+        # Delete source face
+        await faces_coll.delete_one({'_id': ObjectId(face_id)})
+        
+        return len(new_file_refs), None
+        
+    except Exception as e:
+        print("exception merging faces:", str(e))
+        return None, f"Failed to merge faces: {str(e)}"
+
+
 async def get_faces_for_file(file_id, owner_id):
     """Get all faces that appear in a specific file"""
     try:

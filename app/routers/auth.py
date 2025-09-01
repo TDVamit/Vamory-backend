@@ -31,114 +31,7 @@ def deny_if_viewer(current_user: User):
         raise HTTPException(status_code=403, detail="Viewers are not allowed to upload or create resources.")
 
 
-@router.post("/register", response_model=UserResponse)
-async def register(user: UserCreate):
-    """Register a new user"""
-    users_collection = await get_users_collection()
-    
-    # Check if user already exists
-    existing_user = await users_collection.find_one({"email": user.email})
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
-    # Create new user
-    hashed_password = get_password_hash(user.password)
-    user_in_db = UserInDB(
-        **user.dict(exclude={"password"}),
-        hashed_password=hashed_password
-    )
-    
-    result = await users_collection.insert_one(user_in_db.dict(by_alias=True))
-    
-    if result.inserted_id:
-        # Fetch the created user
-        created_user = await users_collection.find_one({"_id": result.inserted_id})
-        created_user["_id"] = str(created_user["_id"])
-        return UserResponse(**created_user)
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create user"
-        )
 
-
-@router.post("/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    """Login user and return tokens"""
-    user = await authenticate_user(form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    # Create tokens
-    access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
-    access_token = create_access_token(
-        data={"sub": user["email"], "user_id": str(user["_id"])},
-        expires_delta=access_token_expires
-    )
-    refresh_token = create_refresh_token()
-    
-    # Save refresh token
-    await save_refresh_token(str(user["_id"]), refresh_token)
-    
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer"
-    }
-
-
-@router.post("/refresh", response_model=Token)
-async def refresh_token(refresh_token: str = Form(...)):
-    """Refresh access token using refresh token"""
-    user_id = await verify_refresh_token(refresh_token)
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token"
-        )
-    
-    # Get user info
-    users_collection = await get_users_collection()
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
-        )
-    
-    # Create new tokens
-    access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
-    access_token = create_access_token(
-        data={"sub": user["email"], "user_id": str(user["_id"])},
-        expires_delta=access_token_expires
-    )
-    new_refresh_token = create_refresh_token()
-    
-    # Replace old refresh token
-    await save_refresh_token(str(user["_id"]), new_refresh_token)
-    
-    return {
-        "access_token": access_token,
-        "refresh_token": new_refresh_token,
-        "token_type": "bearer"
-    }
-
-
-@router.post("/logout", response_model=LogoutResponse)
-async def logout(
-    refresh_token: str = Form(...),
-    current_user: User = Depends(get_current_user)
-):
-    """Logout user by revoking refresh token"""
-    await revoke_refresh_token(refresh_token)
-    return LogoutResponse(message="Successfully logged out")
 
 
 @router.get("/me")
@@ -270,8 +163,8 @@ async def update_user_role(
     if current_user.user_role != UserRole.admin:
         raise HTTPException(status_code=403, detail="Only admins can change user roles.")
     users_collection = await get_users_collection()
-    await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"user_role": user_role}})
-    user_doc = await users_collection.find_one({"_id": ObjectId(user_id)})
+    await users_collection.update_one({"_id": user_id}, {"$set": {"user_role": user_role}})
+    user_doc = await users_collection.find_one({"_id": user_id})
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found")
     user_doc["_id"] = str(user_doc["_id"])
@@ -301,7 +194,7 @@ async def upload_profile_pic(
         raise HTTPException(status_code=400, detail="Failed to process image.")
     
     # Get current user data to check for existing profile pic S3 key
-    current_user_data = await users_collection.find_one({"_id": ObjectId(current_user.id)})
+    current_user_data = await users_collection.find_one({"_id": current_user.id})
     old_profile_pic_s3_key = current_user_data.get("profile_pic_s3_key") if current_user_data else None
     
     # Delete old profile picture from S3 if it exists
@@ -337,7 +230,7 @@ async def upload_profile_pic(
     b64_str = f"data:image/webp;base64,{b64}"
     
     await users_collection.update_one(
-        {"_id": ObjectId(current_user.id)}, 
+        {"_id": current_user.id}, 
         {"$set": {
             "profile_pic": b64_str,  # Legacy base64 for backward compatibility
             "profile_pic_s3_key": s3_key,
@@ -345,7 +238,7 @@ async def upload_profile_pic(
         }}
     )
     
-    user_doc = await users_collection.find_one({"_id": ObjectId(current_user.id)})
+    user_doc = await users_collection.find_one({"_id": current_user.id})
     user_doc["_id"] = str(user_doc["_id"])
     return UserResponse(**user_doc)
 
@@ -356,7 +249,7 @@ async def delete_profile_pic(current_user: User = Depends(get_current_user)):
     users_collection = await get_users_collection()
     
     # Get current user data to check for existing profile pic S3 key
-    current_user_data = await users_collection.find_one({"_id": ObjectId(current_user.id)})
+    current_user_data = await users_collection.find_one({"_id": current_user.id})
     profile_pic_s3_key = current_user_data.get("profile_pic_s3_key") if current_user_data else None
     
     # Delete profile picture from S3 if it exists
@@ -370,7 +263,7 @@ async def delete_profile_pic(current_user: User = Depends(get_current_user)):
     
     # Clear all profile picture fields in database
     await users_collection.update_one(
-        {"_id": ObjectId(current_user.id)}, 
+        {"_id": current_user.id}, 
         {"$set": {
             "profile_pic": None,
             "profile_pic_s3_key": None,
@@ -378,7 +271,7 @@ async def delete_profile_pic(current_user: User = Depends(get_current_user)):
         }}
     )
     
-    user_doc = await users_collection.find_one({"_id": ObjectId(current_user.id)})
+    user_doc = await users_collection.find_one({"_id": current_user.id})
     user_doc["_id"] = str(user_doc["_id"])
     return UserResponse(**user_doc)
 
@@ -400,7 +293,7 @@ async def get_users(
     users_collection = await get_users_collection()
     
     # Build search query
-    query = {"is_active": True, "_id": {"$ne": ObjectId(current_user.id)}}  # Exclude current user
+    query = {"_id": {"$ne": current_user.id}}  
     
     if search:
         # Case-insensitive search in full_name and email

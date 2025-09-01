@@ -2,9 +2,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from bson import ObjectId
-from app.models.folder import StorageType, FolderStatus, ConversionMode
+from app.models.folder import StorageType, FolderStatus
+from app.models.file import ArchivalStatus
 from app.database import get_folders_collection, get_files_collection
 from app.services.s3 import s3_service
+from app.services.storage_tracking import storage_tracking_service
+from app.services.billing_utils import apply_minimum_file_size
 
 
 class StorageConversionService:
@@ -16,7 +19,6 @@ class StorageConversionService:
     
     def calculate_retrieval_times(
         self, 
-        mode: ConversionMode, 
         retrieval_days: Optional[int]
     ) -> Tuple[datetime, datetime, Optional[datetime]]:
         """
@@ -28,11 +30,8 @@ class StorageConversionService:
         now = datetime.now(timezone.utc)
         retrieval_start = now
         
-        # Calculate when files will be ready based on mode
-        if mode == ConversionMode.STANDARD:
-            retrieval_ready = now + timedelta(hours=12)  # 1-12 hours, use 12 for safety
-        else:  # BULK
-            retrieval_ready = now + timedelta(hours=48)  # 5-48 hours, use 48 for safety
+        # Calculate when files will be ready (using bulk mode timing for safety)
+        retrieval_ready = now + timedelta(hours=48)  # 5-48 hours, use 48 for safety
         
         # Calculate expiration time
         if retrieval_days is not None:
@@ -54,37 +53,21 @@ class StorageConversionService:
         """
         now = datetime.now(timezone.utc)
         
-        # Check if this is a Deep Archive retrieval in progress
-        if (folder_doc.get("deep_archive_retrieval_start") and 
-            folder_doc.get("deep_archive_retrieval_ready")):
+        # Check if this is a Deep Archive retrieval in progress using retrieval_expiry_date
+        retrieval_expiry_date = folder_doc.get("retrieval_expiry_date")
+        
+        if retrieval_expiry_date:
+            # Ensure datetime object is timezone-aware
+            if retrieval_expiry_date.tzinfo is None:
+                retrieval_expiry_date = retrieval_expiry_date.replace(tzinfo=timezone.utc)
             
-            retrieval_start = folder_doc["deep_archive_retrieval_start"]
-            retrieval_ready = folder_doc["deep_archive_retrieval_ready"]
-            retrieval_expires = folder_doc.get("deep_archive_retrieval_expires")
-            original_storage = folder_doc.get("deep_archive_original_storage")
-            
-            # Ensure all datetime objects are timezone-aware
-            if retrieval_start and retrieval_start.tzinfo is None:
-                retrieval_start = retrieval_start.replace(tzinfo=timezone.utc)
-            if retrieval_ready and retrieval_ready.tzinfo is None:
-                retrieval_ready = retrieval_ready.replace(tzinfo=timezone.utc)
-            if retrieval_expires and retrieval_expires.tzinfo is None:
-                retrieval_expires = retrieval_expires.replace(tzinfo=timezone.utc)
-            
-            # Phase 1: Converting (start -> ready)
-            if retrieval_ready and now < retrieval_ready:
-                return FolderStatus.CONVERTING, StorageType.DEEP_ARCHIVE
-            
-            # Phase 2: Active (ready -> expires or permanent)
-            elif retrieval_expires is None or now < retrieval_expires:
-                # Files are ready and available
-                target_storage = StorageType(original_storage) if original_storage else StorageType.STANDARD_IA
-                return FolderStatus.ACTIVE, target_storage
-            
-            # Phase 3: Expired - need to clean up and return to Deep Archive
-            else:
+            # If retrieval has expired, clean up and return to Deep Archive
+            if now >= retrieval_expiry_date:
                 await self._cleanup_expired_retrieval(folder_doc["_id"])
                 return FolderStatus.INACTIVE, StorageType.DEEP_ARCHIVE
+            else:
+                # Files are ready and available
+                return FolderStatus.ACTIVE, StorageType.GLACIER_IR
         
         # No Deep Archive retrieval in progress - use actual storage type
         storage_type = StorageType(folder_doc.get("storage_type", StorageType.GLACIER_IR))
@@ -115,24 +98,15 @@ class StorageConversionService:
                     "updated_at": datetime.now(timezone.utc)
                 },
                 "$unset": {
-                    "deep_archive_retrieval_start": "",
-                    "deep_archive_retrieval_ready": "",
-                    "deep_archive_retrieval_expires": "",
-                    "deep_archive_original_storage": "",
                     "retrieval_days": "",
-                    "retrieval_mode": "",
-                    "conversion_job_id": "",
-                    "conversion_started_at": "",
-                    "conversion_estimated_completion": "",
-                    "conversion_from_storage": "",
-                    "conversion_to_storage": ""
+                    "retrieval_expiry_date": ""
                 }
             }
         )
         
-        # Update files back to Deep Archive
+        # Update files back to Deep Archive (excluding deleted files)
         await files_collection.update_many(
-            {"folder_id": {"$in": folder_ids}},
+            {"folder_id": {"$in": folder_ids}, "deleted": False},
             {
                 "$set": {
                     "storage_type": StorageType.DEEP_ARCHIVE.value,
@@ -152,8 +126,7 @@ class StorageConversionService:
         folder_id: str,
         target_storage: StorageType,
         apply_to_children: bool = False,
-        retrieval_days: Optional[int] = None,
-        retrieval_mode: ConversionMode = ConversionMode.BULK
+        retrieval_days: Optional[int] = None
     ) -> Tuple[str, datetime, datetime, Optional[datetime]]:
         """
         Start a Deep Archive retrieval with time-based tracking
@@ -169,7 +142,7 @@ class StorageConversionService:
         
         # Calculate timing
         retrieval_start, retrieval_ready, retrieval_expires = self.calculate_retrieval_times(
-            retrieval_mode, retrieval_days
+            retrieval_days
         )
         
         # Get all folders to be converted
@@ -178,8 +151,8 @@ class StorageConversionService:
         else:
             folder_ids = [folder_id]
         
-        # Get all files that need S3 restoration
-        files_cursor = files_collection.find({"folder_id": {"$in": folder_ids}})
+        # Get all files that need S3 restoration (excluding deleted files)
+        files_cursor = files_collection.find({"folder_id": {"$in": folder_ids}, "deleted": False})
         files_to_restore = await files_cursor.to_list(None)
         
         # Start S3 Deep Archive restoration for all files
@@ -209,21 +182,10 @@ class StorageConversionService:
         # Update folder(s) with Deep Archive retrieval tracking
         update_data = {
             "status": FolderStatus.CONVERTING.value,
-            "conversion_job_id": job_id,
-            "conversion_started_at": retrieval_start,
-            "conversion_estimated_completion": retrieval_ready,
-            "conversion_from_storage": StorageType.DEEP_ARCHIVE.value,
-            "conversion_to_storage": target_storage.value,
-            "deep_archive_retrieval_start": retrieval_start,
-            "deep_archive_retrieval_ready": retrieval_ready,
-            "deep_archive_original_storage": target_storage.value,
             "retrieval_days": retrieval_days,
-            "retrieval_mode": retrieval_mode.value,
+            "retrieval_expiry_date": retrieval_expires,
             "updated_at": datetime.now(timezone.utc)
         }
-        
-        if retrieval_expires:
-            update_data["deep_archive_retrieval_expires"] = retrieval_expires
         
         # Update all affected folders
         folder_object_ids = [ObjectId(fid) for fid in folder_ids]
@@ -234,7 +196,6 @@ class StorageConversionService:
         
         print(f"🚀 Started Deep Archive retrieval job {job_id}")
         print(f"   Target storage: {target_storage.value}")
-        print(f"   Mode: {retrieval_mode.value}")
         print(f"   Ready at: {retrieval_ready}")
         if retrieval_expires:
             print(f"   Expires at: {retrieval_expires}")
@@ -270,8 +231,8 @@ class StorageConversionService:
         
         folder_object_ids = [ObjectId(fid) for fid in folder_ids]
         
-        # Get all files that need S3 storage class conversion
-        files_cursor = files_collection.find({"folder_id": {"$in": folder_ids}})
+        # Get all files that need S3 storage class conversion (excluding deleted files)
+        files_cursor = files_collection.find({"folder_id": {"$in": folder_ids}, "deleted": False})
         files_to_convert = await files_cursor.to_list(None)
         
         # Perform S3 storage class conversion for all files
@@ -337,13 +298,10 @@ class StorageConversionService:
                                         update_payload["thumbnail_s3_key"] = new_thumbnail_key
                                     else:
                                         print(f"⚠️  [DeepArchive] Failed to copy thumbnail {old_thumbnail_key}")
-                                        # Unset thumbnail key if copy fails to avoid pointing to a non-existent file
-                                        update_payload["thumbnail_s3_key"] = None
-                                        update_payload["thumbnail_s3_url"] = None
-                                else:
-                                    # Ensure thumbnail keys are cleared if no original thumbnail
-                                    update_payload["thumbnail_s3_key"] = None
-                                    update_payload["thumbnail_s3_url"] = None
+                                        # Keep original thumbnail key even if copy fails
+                                        # The original thumbnail will still be accessible
+                                # Keep existing thumbnail keys if no original thumbnail
+                                # No need to clear thumbnail references
 
                                 # Update DB record for this file to point to new S3 key(s) and Deep Archive
                                 await files_collection.update_one(
@@ -391,6 +349,18 @@ class StorageConversionService:
             }}
         )
         
+        # Track storage usage changes for all affected files
+        files_to_track = await files_collection.find({"folder_id": {"$in": folder_ids}}).to_list(None)
+        for file_doc in files_to_track:
+            # Move storage from old type to new type (with minimum 128KB)
+            billing_size = apply_minimum_file_size(file_doc.get("file_size", 0))
+            await storage_tracking_service.move_storage_usage(
+                user_id=file_doc["owner_id"],
+                size_bytes=billing_size,
+                from_storage=storage_from,
+                to_storage=storage_to
+            )
+        
         # Update files
         file_result = await files_collection.update_many(
             {"folder_id": {"$in": folder_ids}},
@@ -400,13 +370,15 @@ class StorageConversionService:
             }}
         )
         
-        # Handle thumbnails for Deep Archive
+        # Update archival status for Deep Archive
         if storage_to == StorageType.DEEP_ARCHIVE:
-            # Keep thumbnails but remove references from database for consistency
-            # (Thumbnails will remain in S3 but won't be accessible via API)
+            # Update archival_status to deep_archive but keep thumbnail references
             await files_collection.update_many(
                 {"folder_id": {"$in": folder_ids}},
-                {"$unset": {"thumbnail_s3_key": "", "thumbnail_s3_url": ""}}
+                {"$set": {
+                    "archival_status": ArchivalStatus.DEEP_ARCHIVE.value,
+                    "archived_at": datetime.now(timezone.utc)
+                }}
             )
         
         print(f"✅ Immediate conversion completed: {storage_from.value} → {storage_to.value}")
@@ -428,8 +400,8 @@ class StorageConversionService:
         else:
             folder_ids = [folder_id]
 
-        # Check all files' storage_type
-        files_cursor = files_collection.find({"folder_id": {"$in": folder_ids}})
+        # Check all files' storage_type (excluding deleted files)
+        files_cursor = files_collection.find({"folder_id": {"$in": folder_ids}, "deleted": False})
         files = await files_cursor.to_list(None)
         not_converted = [f for f in files if f.get("storage_type") != target_storage.value]
 
@@ -438,55 +410,43 @@ class StorageConversionService:
             now = datetime.now(timezone.utc)
             # Check if this is a Deep Archive retrieval window
             sample_folder = await folders_collection.find_one({"_id": ObjectId(folder_ids[0])}) if folder_ids else None
-            retrieval_expires = sample_folder.get("deep_archive_retrieval_expires") if sample_folder else None
+            retrieval_expiry_date = sample_folder.get("retrieval_expiry_date") if sample_folder else None
             # Ensure timezone-aware
-            if retrieval_expires and retrieval_expires.tzinfo is None:
-                retrieval_expires = retrieval_expires.replace(tzinfo=timezone.utc)
-            if retrieval_expires:
-                if now > retrieval_expires:
+            if retrieval_expiry_date and retrieval_expiry_date.tzinfo is None:
+                retrieval_expiry_date = retrieval_expiry_date.replace(tzinfo=timezone.utc)
+            if retrieval_expiry_date:
+                if now > retrieval_expiry_date:
                     # Retrieval window expired: return to Deep Archive and clear fields
                     update_data = {
                         "status": FolderStatus.INACTIVE.value,
                         "storage_type": StorageType.DEEP_ARCHIVE.value,
-                        "updated_at": now,
-                        "conversion_job_id": None,
-                        "conversion_started_at": None,
-                        "conversion_estimated_completion": None,
-                        "conversion_from_storage": None,
-                        "conversion_to_storage": None,
-                        "deep_archive_retrieval_start": None,
-                        "deep_archive_retrieval_ready": None,
-                        "deep_archive_retrieval_expires": None,
-                        "deep_archive_original_storage": None,
-                        "retrieval_days": None,
-                        "retrieval_mode": None
+                        "updated_at": now
                     }
+                    # Clear retrieval fields
+                    await folders_collection.update_many(
+                        {"_id": {"$in": [ObjectId(fid) for fid in folder_ids]}},
+                        {"$unset": {"retrieval_days": "", "retrieval_expiry_date": ""}}
+                    )
                 else:
                     # Retrieval window active: set ACTIVE but keep retrieval fields
                     update_data = {
                         "status": FolderStatus.ACTIVE.value,
                         "storage_type": sample_folder.get("storage_type"),
                         "updated_at": now
-                        # Do NOT clear retrieval/conversion fields
+                        # Do NOT clear retrieval fields
                     }
             else:
                 # Not a Deep Archive retrieval: clear fields as before
                 update_data = {
                     "status": FolderStatus.ACTIVE.value,
                     "storage_type": target_storage.value,
-                    "updated_at": now,
-                    "conversion_job_id": None,
-                    "conversion_started_at": None,
-                    "conversion_estimated_completion": None,
-                    "conversion_from_storage": None,
-                    "conversion_to_storage": None,
-                    "deep_archive_retrieval_start": None,
-                    "deep_archive_retrieval_ready": None,
-                    "deep_archive_retrieval_expires": None,
-                    "deep_archive_original_storage": None,
-                    "retrieval_days": None,
-                    "retrieval_mode": None
+                    "updated_at": now
                 }
+                # Clear retrieval fields
+                await folders_collection.update_many(
+                    {"_id": {"$in": [ObjectId(fid) for fid in folder_ids]}},
+                    {"$unset": {"retrieval_days": "", "retrieval_expiry_date": ""}}
+                )
             await folders_collection.update_many(
                 {"_id": {"$in": [ObjectId(fid) for fid in folder_ids]}},
                 {"$set": update_data}
@@ -503,7 +463,7 @@ class StorageConversionService:
         
         async def get_children(folder_id: str):
             children = await folders_collection.find(
-                {"parent_folder_id": folder_id}
+                {"parent_folder_id": folder_id, "deleted": False}
             ).to_list(None)
             
             for child in children:
@@ -514,12 +474,7 @@ class StorageConversionService:
         await get_children(parent_folder_id)
         return all_folders
     
-    def get_cost_savings_info(self, mode: ConversionMode, file_count: int) -> str:
-        """Get cost savings information for bulk mode"""
-        if mode == ConversionMode.BULK:
-            estimated_savings = min(file_count * 0.02, 100)  # Rough estimate
-            return f"Bulk mode saves approximately ${estimated_savings:.2f} compared to Standard mode"
-        return "Standard mode provides balanced cost and speed"
+
 
 
 # Global instance

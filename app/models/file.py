@@ -30,8 +30,7 @@ class FileType(str, Enum):
 
 
 class StorageType(str, Enum):
-    STANDARD = "STANDARD"          # S3 Standard (for thumbnails)
-    STANDARD_IA = "STANDARD_IA"    # S3 Standard – Infrequent Access (IA)
+    STANDARD = "STANDARD"          # S3 Standard
     GLACIER_IR = "GLACIER_IR"      # S3 Glacier Instant Retrieval
     DEEP_ARCHIVE = "DEEP_ARCHIVE"  # S3 Glacier Deep Archive
 
@@ -48,6 +47,7 @@ class FileBase(BaseModel):
     file_type: FileType
     content_type: str
     file_size: int
+    billing_size: Optional[int] = None  # Total billing size including thumbnail
     folder_id: str
 
 
@@ -63,7 +63,7 @@ class FileInDB(FileBase):
     thumbnail_s3_key: Optional[str] = None
     thumbnail_s3_url: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    storage_type: StorageType = StorageType.GLACIER_IR
+    storage_type: StorageType = StorageType.STANDARD
     archival_status: ArchivalStatus = ArchivalStatus.ACTIVE
     archived_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -73,6 +73,8 @@ class FileInDB(FileBase):
     face_references: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
     image_description: Optional[str] = None
     video_description: Optional[str] = None
+    deleted: bool = False
+    deleted_at: Optional[datetime] = None
 
     class Config:
         populate_by_name = True
@@ -88,7 +90,7 @@ class File(FileBase):
     thumbnail_s3_key: Optional[str] = None
     thumbnail_s3_url: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    storage_type: StorageType = StorageType.GLACIER_IR
+    storage_type: StorageType = StorageType.STANDARD
     archival_status: ArchivalStatus = ArchivalStatus.ACTIVE
     archived_at: Optional[datetime] = None
     created_at: datetime
@@ -98,6 +100,8 @@ class File(FileBase):
     face_references: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
     image_description: Optional[str] = None
     video_description: Optional[str] = None
+    deleted: bool = False
+    deleted_at: Optional[datetime] = None
 
     class Config:
         populate_by_name = True
@@ -169,4 +173,46 @@ class FileDeleteResponse(BaseModel):
 class PaginatedFilesResponse(BaseModel):
     """Paginated response for files"""
     data: List['File'] = Field(..., description="List of files")
-    meta: PaginationMetadata = Field(..., description="Pagination metadata") 
+    meta: PaginationMetadata = Field(..., description="Pagination metadata")
+
+
+class DeletedFileResponse(BaseModel):
+    """Response model for deleted files with parent folder information"""
+    id: str = Field(..., alias="_id")
+    filename: str
+    original_filename: str
+    file_type: FileType
+    content_type: str
+    file_size: int
+    folder_id: str
+    folder_name: str
+    owner_id: str
+    s3_key: str
+    s3_url: str
+    thumbnail_s3_key: Optional[str] = None
+    thumbnail_s3_url: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    storage_type: StorageType = StorageType.STANDARD
+    archival_status: ArchivalStatus = ArchivalStatus.ACTIVE
+    archived_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+    deleted: bool = True
+    deleted_at: Optional[datetime] = None
+
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class PaginatedDeletedFilesResponse(BaseModel):
+    """Paginated response for deleted files"""
+    data: List[DeletedFileResponse] = Field(..., description="List of deleted files")
+    meta: PaginationMetadata = Field(..., description="Pagination metadata")
+
+
+class RestoreFileResponse(BaseModel):
+    """Response model for file restoration"""
+    message: str
+    file_id: str 

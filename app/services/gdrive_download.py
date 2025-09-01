@@ -13,8 +13,10 @@ from app.models.file import FileType, FileInDB
 from app.models.folder import StorageType, FolderStatus
 from app.services.s3 import s3_service
 from app.services.thumbnail import thumbnail_service
+from app.services.storage_tracking import storage_tracking_service
 from app.database import get_files_collection, get_folders_collection
 from app.routers.files import calculate_file_hash, should_generate_thumbnail
+from app.services.billing_utils import apply_minimum_file_size, calculate_total_billing_size
 from app.config import settings
 from app.services.face_recognition import face_detection
 from app.services.AI_search_util import get_image_description
@@ -128,7 +130,8 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
             if existing:
                 existing_storage = StorageType(existing['storage_type'])
                 if (
-                    (existing_storage in [StorageType.STANDARD_IA, StorageType.GLACIER_IR] and StorageType(storage_type) in [StorageType.STANDARD_IA, StorageType.GLACIER_IR]) or
+                    (existing_storage == StorageType.STANDARD and StorageType(storage_type) == StorageType.STANDARD) or
+                    (existing_storage == StorageType.GLACIER_IR and StorageType(storage_type) == StorageType.GLACIER_IR) or
                     (existing_storage == StorageType.DEEP_ARCHIVE and StorageType(storage_type) == StorageType.DEEP_ARCHIVE)
                 ):
                     deduplicate = True
@@ -178,44 +181,39 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                             video_stream = io.BytesIO(content)
                             thumbnail_stream = await loop.run_in_executor(None, functools.partial(thumbnail_service.generate_video_thumbnail, video_stream))
                             
-                            # Process video for description
-                            try:
-                                # Save video to temp file for processing
-                                import tempfile
-                                with tempfile.NamedTemporaryFile(suffix=f".{os.path.splitext(name)[1].lower().lstrip('.')}", delete=False) as temp_video:
-                                    temp_video.write(content)
-                                    temp_video_path = temp_video.name
-                                
-                                # Generate video description with transcription
-                                video_description = await video_processor.process_video(temp_video_path)
-                                
-                                # Generate embedding and add to vector database
-                                embedding_response = await openai_client.embeddings.create(
-                                    model=settings.OPENAI_EMBEDDING_MODEL,
-                                    input=video_description
-                                )
-                                video_vector = embedding_response.data[0].embedding
-                                await vector_db.add(video_description, str(fid), user_id, video_vector)
-                                
-                                metadata = {
-                                    'format': os.path.splitext(name)[1].lower().lstrip('.'),
-                                    'content_type': content_type,
-                                    'size': size
-                                }
-                                
-                                # Clean up temp file
-                                try:
-                                    os.unlink(temp_video_path)
-                                except:
-                                    pass
-                                    
-                            except Exception as e:
-                                print(f"[VIDEO PROCESSING ERROR] {name}: {e}")
-                                metadata = {
-                                    'format': os.path.splitext(name)[1].lower().lstrip('.'),
-                                    'content_type': content_type,
-                                    'size': size
-                                }
+                            # COMMENTED OUT: Process video for description
+                            # try:
+                            #     # Save video to temp file for processing
+                            #     import tempfile
+                            #     with tempfile.NamedTemporaryFile(suffix=f".{os.path.splitext(name)[1].lower().lstrip('.')}", delete=False) as temp_video:
+                            #         temp_video.write(content)
+                            #         temp_video_path = temp_video.name
+                            #     
+                            #     # Generate video description with transcription
+                            #     video_description = await video_processor.process_video(temp_video_path)
+                            #     
+                            #     # Generate embedding and add to vector database
+                            #     embedding_response = await openai_client.embeddings.create(
+                            #         model=settings.OPENAI_EMBEDDING_MODEL,
+                            #         input=video_description
+                            #     )
+                            #     video_vector = embedding_response.data[0].embedding
+                            #     await vector_db.add(video_description, str(fid), user_id, video_vector)
+                            #     
+                            #     # Clean up temp file
+                            #     try:
+                            #         os.unlink(temp_video_path)
+                            #     except:
+                            #         pass
+                            #         
+                            # except Exception as e:
+                            #     print(f"[VIDEO PROCESSING ERROR] {name}: {e}")
+                            
+                            metadata = {
+                                'format': os.path.splitext(name)[1].lower().lstrip('.'),
+                                'content_type': content_type,
+                                'size': size
+                            }
                         else:
                             thumbnail_stream = None
 
@@ -223,12 +221,27 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                             thumbnail_key = s3_service.generate_s3_key(user_id, parent_db_id, f"thumb_{name}", "thumbnail")
                             if isinstance(thumbnail_stream, io.BytesIO):
                                 thumbnail_stream.seek(0)
+                                thumbnail_size = len(thumbnail_stream.getvalue())
                                 await s3_service.upload_file(thumbnail_stream, thumbnail_key, "image/webp", StorageType(storage_type))
                             else:
+                                thumbnail_size = len(thumbnail_stream) if isinstance(thumbnail_stream, bytes) else 0
                                 await s3_service.upload_file(io.BytesIO(thumbnail_stream), thumbnail_key, "image/webp", StorageType(storage_type))
+                            
+                            # Track thumbnail storage usage (with minimum 128KB)
+                            thumbnail_billing_size = apply_minimum_file_size(thumbnail_size)
+                            await storage_tracking_service.update_user_storage(
+                                user_id=user_id,
+                                size_bytes=thumbnail_billing_size,
+                                storage_type=StorageType(storage_type),
+                                operation="upload"
+                            )
                     except Exception as e:
                         print(f"[THUMBNAIL ERROR] {name}: {e}")
 
+            # Calculate billing size
+            thumbnail_size = 128 * 1024 if thumbnail_key else 0
+            billing_size = calculate_total_billing_size(size, thumbnail_size)
+            
             # Insert DB record
             file_doc = FileInDB(
                 filename=name,
@@ -236,6 +249,7 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                 file_type=file_type,
                 content_type=content_type,
                 file_size=size,
+                billing_size=billing_size,
                 folder_id=parent_db_id,
                 owner_id=user_id,
                 s3_key=s3_key,
@@ -251,6 +265,16 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
             )
             result = await files_collection.insert_one(file_doc.dict(by_alias=True))
             await folders_collection.update_one({'_id': ObjectId(parent_db_id)}, {'$inc': {'file_count': 1}})
+            
+            # Track storage usage for Google Drive upload (with minimum 128KB)
+            thumbnail_size = 128 * 1024 if thumbnail_key else 0  # Estimate thumbnail size
+            await storage_tracking_service.update_user_storage_with_billing_size(
+                user_id=user_id,
+                file_size=size,
+                thumbnail_size=thumbnail_size,
+                storage_type=StorageType(storage_type),
+                operation="upload"
+            )
 
         finally:
             # Clean up local file and release semaphore

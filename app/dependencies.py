@@ -9,7 +9,7 @@ import requests
 import json
 from app.config import settings
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 security = HTTPBearer()
 
@@ -61,6 +61,48 @@ async def verify_jwt(token: str) -> dict:
         raise HTTPException(status_code=401, detail=f"Token validation error: {str(exc)}")
 
 
+async def verify_public_token_func(token: str) -> dict:
+    
+    """Verify a public token - internal function"""
+    try:
+        token_data = jwt.decode(token, settings.PUBLIC_SECRET_KEY, algorithms=[settings.algorithm])
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+    
+    if not token_data:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    if token_data.get("origin") != "vamory.vadaevri.com":
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    created_at = token_data.get("created_at")
+    if not created_at:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    # Convert created_at if it's a string timestamp
+    if isinstance(created_at, str):
+        try:
+            created_at = datetime.fromisoformat(created_at)
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid token: malformed timestamp")
+
+    # Ensure both datetimes are offset-aware (UTC)
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+
+    if now - created_at > timedelta(minutes=10):
+        raise HTTPException(status_code=401, detail="Token expired")
+
+    return token_data
+
+
+async def verify_public_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """FastAPI dependency to verify public token from query parameter"""
+    return await verify_public_token_func(credentials.credentials)
+
+
+
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> "User":
     """Get current authenticated user model"""
     from app.models.user import User  # local import to avoid circular
@@ -80,9 +122,11 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             "email": payload.get("https://vamory.vadaevri.comemail"),
             "full_name": payload.get("https://vamory.vadaevri.comname"),
             "user_role": "user",
-            "credits": 0,
+            "credits": 0.0,
             "storage_used_standard": 0,
             "storage_used_archived": 0,
+            "storage_used_standard_deleted": 0,
+            "storage_used_archived_deleted": 0,
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
         }
@@ -180,9 +224,11 @@ async def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depend
             "email": payload.get("https://vamory.vadaevri.comemail"),
             "full_name": payload.get("https://vamory.vadaevri.comname"),
             "user_role": "user",
-            "credits": 0,
+            "credits": 0.0,
             "storage_used_standard": 0,
             "storage_used_archived": 0,
+            "storage_used_standard_deleted": 0,
+            "storage_used_archived_deleted": 0,
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
         }

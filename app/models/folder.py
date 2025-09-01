@@ -30,7 +30,6 @@ class AccessLevel(str, Enum):
 
 class StorageType(str, Enum):
     STANDARD = "STANDARD"          # S3 Standard
-    STANDARD_IA = "STANDARD_IA"    # S3 Standard – Infrequent Access (IA)
     GLACIER_IR = "GLACIER_IR"      # S3 Glacier Instant Retrieval
     DEEP_ARCHIVE = "DEEP_ARCHIVE"  # S3 Glacier Deep Archive
 
@@ -42,9 +41,7 @@ class FolderStatus(str, Enum):
     COPYING = "copying"            # Folder is being copied/imported
 
 
-class ConversionMode(str, Enum):
-    STANDARD = "Standard"          # 1-12 hours, higher cost
-    BULK = "Bulk"                 # 5-12 hours, lower cost
+
 
 
 class PaginatedFoldersResponse(BaseModel):
@@ -81,26 +78,15 @@ class FolderInDB(FolderBase):
     file_count: int = 0
     subfolder_count: int = 0
     
-    # Conversion tracking fields
-    conversion_job_id: Optional[str] = None
-    conversion_started_at: Optional[datetime] = None
-    conversion_estimated_completion: Optional[datetime] = None
-    conversion_from_storage: Optional[StorageType] = None
-    conversion_to_storage: Optional[StorageType] = None
-    
     # Deep Archive specific fields
     retrieval_days: Optional[int] = None  # How many days to retrieve from Deep Archive (1-365, None = forever)
-    retrieval_mode: Optional[ConversionMode] = None
-    auto_return_to_standard: bool = False  # If True, automatically move to Standard after retrieval_days
+    retrieval_expiry_date: Optional[datetime] = None  # When retrieval expires (back to Deep Archive)
     
-    # New time-based conversion fields
-    deep_archive_retrieval_start: Optional[datetime] = None      # When retrieval started
-    deep_archive_retrieval_ready: Optional[datetime] = None      # When files will be ready
-    deep_archive_retrieval_expires: Optional[datetime] = None    # When retrieval expires (back to Deep Archive)
-    deep_archive_original_storage: Optional[StorageType] = None  # Original storage before Deep Archive
     # Public sharing fields
     is_public: bool = False
     public_token: Optional[str] = None
+    deleted: bool = False
+    deleted_at: Optional[datetime] = None
 
     class Config:
         populate_by_name = True
@@ -122,23 +108,12 @@ class Folder(FolderBase):
     total_size: Optional[int] = Field(None, description="Total size in bytes including all files and subfolders")
     thumbnail_url: Optional[str] = Field(None, description="Thumbnail URL of the first file in the folder, if available")
     
-    # Conversion tracking fields
-    conversion_job_id: Optional[str] = None
-    conversion_started_at: Optional[datetime] = None
-    conversion_estimated_completion: Optional[datetime] = None
-    conversion_from_storage: Optional[StorageType] = None
-    conversion_to_storage: Optional[StorageType] = None
-    
     # Deep Archive specific fields
     retrieval_days: Optional[int] = None
-    retrieval_mode: Optional[ConversionMode] = None
-    auto_return_to_standard: bool = False
+    retrieval_expiry_date: Optional[datetime] = None  # When retrieval expires (back to Deep Archive)
     
-    # New time-based conversion fields
-    deep_archive_retrieval_start: Optional[datetime] = None      # When retrieval started
-    deep_archive_retrieval_ready: Optional[datetime] = None      # When files will be ready
-    deep_archive_retrieval_expires: Optional[datetime] = None    # When retrieval expires (back to Deep Archive)
-    deep_archive_original_storage: Optional[StorageType] = None  # Original storage before Deep Archive
+    deleted: bool = False
+    deleted_at: Optional[datetime] = None
 
     class Config:
         populate_by_name = True
@@ -200,7 +175,6 @@ class StorageTypeChangeRequest(BaseModel):
     
     # Deep Archive conversion settings
     retrieval_days: Optional[int] = Field(None, ge=1, le=365, description="Days to retrieve from Deep Archive (1-365). Use None for permanent retrieval.")
-    retrieval_mode: ConversionMode = ConversionMode.BULK
     
     @validator('apply_to_children')
     def validate_deep_archive_children(cls, v, values):
@@ -227,15 +201,8 @@ class StorageTypeChangeResponse(BaseModel):
     new_storage_type: str
     new_status: FolderStatus
     
-    # Conversion tracking
-    conversion_job_id: Optional[str] = None
-    estimated_completion_time: Optional[datetime] = None
-    is_immediate: bool = True
-    
     # Deep Archive specific
     retrieval_days: Optional[int] = None
-    retrieval_mode: Optional[ConversionMode] = None
-    bulk_mode_savings: Optional[str] = None  # Cost savings info
     
     storage_type: Optional[str] = None  # For backwards compatibility
 

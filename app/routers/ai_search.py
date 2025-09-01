@@ -3,7 +3,7 @@ from typing import Dict, List, Any, Set
 from bson import ObjectId
 import asyncio
 
-from app.dependencies import get_current_user_id
+from app.dependencies import get_current_user_id , verify_public_token
 from app.services.AI_search_util import enhance_search
 from app.services.vector_db import vector_db
 from app.database import get_files_collection, get_folders_collection
@@ -32,6 +32,32 @@ async def get_folder_and_subfolder_ids(folder_id: str, user_id: str) -> set:
         subfolders = await folders_collection.find({
             "parent_folder_id": current_folder_id,
             "owner_id": user_id
+        }).to_list(length=None)
+        
+        for subfolder in subfolders:
+            subfolder_id = str(subfolder["_id"])
+            if subfolder_id not in folder_ids:
+                folder_ids.add(subfolder_id)
+                to_process.append(subfolder_id)
+    
+    return folder_ids
+
+
+async def get_public_folder_and_subfolder_ids(folder_id: str, public_token: str) -> set:
+    """Get the specified public folder ID and all its public subfolder IDs recursively"""
+    folder_ids = {folder_id}
+    folders_collection = await get_folders_collection()
+    
+    # Get all public subfolders recursively
+    to_process = [folder_id]
+    while to_process:
+        current_folder_id = to_process.pop(0)
+        
+        # Find all public subfolders of the current folder with the same token
+        subfolders = await folders_collection.find({
+            "parent_folder_id": current_folder_id,
+            "is_public": True,
+            "public_token": public_token
         }).to_list(length=None)
         
         for subfolder in subfolders:
@@ -80,6 +106,7 @@ async def ai_search(
     folder_id: str = None
 ):
     """Search user images using an enhanced textual query and categorize results by detected names.
+    NOTE: Video processing is currently disabled.
 
     Args:
         query: The search query to enhance and search for
@@ -90,7 +117,7 @@ async def ai_search(
     1. Enhance the query using Gemini (`enhance_search`) to obtain an enriched description and list of mentioned names.
     2. Query the vector database with the enhanced description to retrieve the top 20 matching images.
     3. If folder_id is provided, filter results to only include files from the specified folder and its subfolders.
-    4. For every returned image, fetch its faces and determine which names (if any) appear in it.
+    4. For every returned image (excluding videos), fetch its faces and determine which names (if any) appear in it.
     5. Group the images into categories:
        • `<name1> and <name2>` – images containing all mentioned names.
        • `only <nameX>` – images containing only one of the mentioned names.
@@ -194,13 +221,16 @@ async def ai_search(
             # Check file type to handle differently
             file_type = file_doc.get("file_type", "image")
             
-            if file_type == "video":
-                # For videos, don't detect faces, just categorize based on content
-                # Videos are categorized in "videos" category
-                if "videos" not in categories:
-                    categories["videos"] = []
-                categories["videos"].append(file_doc)
-            else:
+            # COMMENTED OUT: Skip video processing for now
+            # if file_type == "video":
+            #     # For videos, don't detect faces, just categorize based on content
+            #     # Videos are categorized in "videos" category
+            #     if "videos" not in categories:
+            #         categories["videos"] = []
+            #     categories["videos"].append(file_doc)
+            # else:
+            
+            if file_type != "video":  # Only process non-video files
                 # For images, fetch faces and categorize by names
                 faces_info = await get_faces_for_file(img_id, user_id)
                 names_in_image = {f.get("name", "").lower() for f in faces_info if f.get("name")}
@@ -212,6 +242,179 @@ async def ai_search(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+# Create a public router for AI search
+public_router = APIRouter(prefix="/public/ai-search", tags=["Public AI Search"])
+
+@public_router.get("/", summary="AI-powered search across public folder images")
+async def public_ai_search(
+    query: str,
+    token: str,
+    folder_id: str = None,
+    verify_public_token: dict = Depends(verify_public_token)
+):
+    """Search public folder images using an enhanced textual query and categorize results by detected names.
+    NOTE: Video processing is currently disabled.
+
+    Args:
+        query: The search query to enhance and search for
+        token: Public token for accessing the folder
+        folder_id: Optional folder ID to limit search to files in this folder and its subfolders
+
+    Steps:
+    1. Validate public folder access using the token
+    2. Enhance the query using Gemini (`enhance_search`) to obtain an enriched description and list of mentioned names.
+    3. Query the vector database with the enhanced description to retrieve the top 20 matching images.
+    4. Filter results to only include files from the specified public folder and its subfolders.
+    5. For every returned image (excluding videos), fetch its faces and determine which names (if any) appear in it.
+    6. Group the images into categories:
+       • `<name1> and <name2>` – images containing all mentioned names.
+       • `only <nameX>` – images containing only one of the mentioned names.
+       • `no names` – images where none of the mentioned names are detected.
+    """
+    try:
+        # 1. Validate public folder access
+        folders_collection = await get_folders_collection()
+        
+        if folder_id:
+            # Validate specific folder
+            folder = await folders_collection.find_one({
+                "_id": ObjectId(folder_id),
+                "is_public": True,
+                "public_token": token
+            })
+            if not folder:
+                raise HTTPException(status_code=404, detail="Public folder not found or not public")
+            
+            # Get owner_id from the folder for vector search
+            owner_id = folder["owner_id"]
+            
+            # Get all public folder IDs (including subfolders)
+            allowed_folder_ids = await get_public_folder_and_subfolder_ids(folder_id, token)
+        else:
+            # Find root folder by token
+            root_folder = await folders_collection.find_one({
+                "public_token": token,
+                "is_public": True,
+                "parent_folder_id": {"$exists": False}  # Root folder
+            })
+            if not root_folder:
+                raise HTTPException(status_code=404, detail="Public folder not found or not public")
+            
+            owner_id = root_folder["owner_id"]
+            
+            # Get all public folders with this token
+            public_folders = await folders_collection.find({
+                "public_token": token,
+                "is_public": True
+            }).to_list(length=None)
+            
+            allowed_folder_ids = {str(folder["_id"]) for folder in public_folders}
+
+        # 2. Enhance query
+        enhancement_result = await enhance_search(query)
+        enhanced_query: str = enhancement_result.get("enhanced_query", query)
+        mentioned_names: List[str] = enhancement_result.get("mentioned_names", [])
+
+        # Normalise names to lowercase for comparison consistency
+        mentioned_names = [name.lower() for name in mentioned_names]
+
+        # 3. Generate embedding for the enhanced query
+        embedding_response = await openai_client.embeddings.create(
+            model=settings.OPENAI_EMBEDDING_MODEL,
+            input=enhanced_query
+        )
+        query_vector = embedding_response.data[0].embedding
+        
+        # 4. Vector DB search (top 20)
+        search_results = await vector_db.query(enhanced_query, owner_id, query_vector, top_k=20)
+        
+        image_ids = [res["payload"]["image_id"] for res in search_results]
+
+        # Prepare category structure
+        categories: Dict[str, List[Dict[str, Any]]] = _initialize_category_structure(mentioned_names)
+
+        if not image_ids:
+            return {"categories": categories}
+
+        # 5. Fetch files and filter by public folder access
+        files_collection = await get_files_collection()
+        
+        # Filter files by public folder access
+        file_docs_cursor = files_collection.find({
+            "_id": {"$in": [ObjectId(i) for i in image_ids]},
+            "folder_id": {"$in": list(allowed_folder_ids)}
+        })
+        
+        file_docs = await file_docs_cursor.to_list(length=len(image_ids))
+        file_docs_map = {str(doc["_id"]): doc for doc in file_docs}
+
+        # Generate presigned URLs for all files in parallel
+        presigned_url_tasks = []
+        for res in search_results:
+            img_id = res["payload"]["image_id"]
+            file_doc = file_docs_map.get(img_id)
+            if not file_doc:
+                continue  # Skip missing docs
+
+            # Convert ObjectId to string for response
+            file_doc["_id"] = str(file_doc["_id"])
+
+            # Create tasks for presigned URL generation
+            if file_doc.get("s3_key"):
+                presigned_url_tasks.append(s3_service.generate_presigned_url(file_doc["s3_key"], 3600))
+            else:
+                presigned_url_tasks.append(None)
+                
+            if file_doc.get("thumbnail_s3_key"):
+                presigned_url_tasks.append(s3_service.generate_presigned_url(file_doc["thumbnail_s3_key"], 3600))
+            else:
+                presigned_url_tasks.append(None)
+
+        # Execute all presigned URL generation in parallel
+        if presigned_url_tasks:
+            presigned_urls = await asyncio.gather(*[task for task in presigned_url_tasks if task is not None])
+            
+            # Assign presigned URLs back to file documents
+            url_index = 0
+            for res in search_results:
+                img_id = res["payload"]["image_id"]
+                file_doc = file_docs_map.get(img_id)
+                if not file_doc:
+                    continue
+
+                if file_doc.get("s3_key"):
+                    file_doc["s3_url"] = presigned_urls[url_index]
+                    url_index += 1
+                if file_doc.get("thumbnail_s3_key"):
+                    file_doc["thumbnail_s3_url"] = presigned_urls[url_index]
+                    url_index += 1
+
+        # 6. Iterate over vector results preserving relevance order
+        for res in search_results:
+            img_id = res["payload"]["image_id"]
+            file_doc = file_docs_map.get(img_id)
+            if not file_doc:
+                continue  # Skip missing docs
+
+            # Check file type to handle differently
+            file_type = file_doc.get("file_type", "image")
+            
+            if file_type != "video":  # Only process non-video files
+                # For images, fetch faces and categorize by names
+                faces_info = await get_faces_for_file(img_id, owner_id)
+                names_in_image = {f.get("name", "").lower() for f in faces_info if f.get("name")}
+                _place_in_category(categories, file_doc, names_in_image, mentioned_names)
+
+        return {"categories": categories}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# Register the public router
+router.include_router(public_router)
 
 
 

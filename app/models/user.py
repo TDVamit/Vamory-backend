@@ -34,9 +34,11 @@ class UserBase(BaseModel):
     email: EmailStr
     full_name: str = Field(..., min_length=1, max_length=100)
     is_active: bool = True
-    credits: int = 0
+    credits: float = 0.0
     storage_used_standard: int = 0
     storage_used_archived: int = 0
+    storage_used_standard_deleted: int = 0
+    storage_used_archived_deleted: int = 0
     user_role: UserRole = UserRole.user
     profile_pic: Optional[str] = None
     profile_pic_s3_key: Optional[str] = None
