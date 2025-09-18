@@ -238,9 +238,14 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                     except Exception as e:
                         print(f"[THUMBNAIL ERROR] {name}: {e}")
 
-            # Calculate billing size
-            thumbnail_size = 128 * 1024 if thumbnail_key else 0
-            billing_size = calculate_total_billing_size(size, thumbnail_size)
+            # Calculate initial billing size (file only, thumbnail will be added later)
+            initial_billing_size = apply_minimum_file_size(size)
+            total_file_billing_size = initial_billing_size
+            
+            # If thumbnail was generated, calculate total billing size
+            if thumbnail_key:
+                thumbnail_size = 128 * 1024  # Estimate thumbnail size for gdrive
+                total_file_billing_size = calculate_total_billing_size(size, thumbnail_size)
             
             # Insert DB record
             file_doc = FileInDB(
@@ -248,8 +253,7 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
                 original_filename=name,
                 file_type=file_type,
                 content_type=content_type,
-                file_size=size,
-                billing_size=billing_size,
+                file_size=total_file_billing_size,
                 folder_id=parent_db_id,
                 owner_id=user_id,
                 s3_key=s3_key,
@@ -266,15 +270,24 @@ async def process_gdrive_import(gdrive_url: str, root_folder_id: str, user_id: s
             result = await files_collection.insert_one(file_doc.dict(by_alias=True))
             await folders_collection.update_one({'_id': ObjectId(parent_db_id)}, {'$inc': {'file_count': 1}})
             
-            # Track storage usage for Google Drive upload (with minimum 128KB)
-            thumbnail_size = 128 * 1024 if thumbnail_key else 0  # Estimate thumbnail size
-            await storage_tracking_service.update_user_storage_with_billing_size(
+            # Track storage usage for Google Drive upload
+            # Track file storage
+            await storage_tracking_service.update_user_storage(
                 user_id=user_id,
-                file_size=size,
-                thumbnail_size=thumbnail_size,
+                size_bytes=initial_billing_size,
                 storage_type=StorageType(storage_type),
                 operation="upload"
             )
+            
+            # Track thumbnail storage if thumbnail was generated
+            if thumbnail_key:
+                thumbnail_size = 128 * 1024  # Estimate thumbnail size for gdrive
+                await storage_tracking_service.update_user_storage(
+                    user_id=user_id,
+                    size_bytes=thumbnail_size,
+                    storage_type=StorageType.STANDARD,  # Thumbnails always use STANDARD storage
+                    operation="upload"
+                )
 
         finally:
             # Clean up local file and release semaphore

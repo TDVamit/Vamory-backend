@@ -29,6 +29,6 @@ def calculate_total_billing_size(file_size: int, thumbnail_size: int = 0) -> int
         The total billing size (file + thumbnail, each with minimum 128KB)
     """
     file_billing_size = apply_minimum_file_size(file_size)
-    thumbnail_billing_size = apply_minimum_file_size(thumbnail_size) if thumbnail_size > 0 else 0
+    thumbnail_billing_size = thumbnail_size
     
     return file_billing_size + thumbnail_billing_size

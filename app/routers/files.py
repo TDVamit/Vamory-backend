@@ -145,38 +145,23 @@ async def upload_file(
             detail="File size could not be determined"
         )
     file_extension = os.path.splitext(file.filename)[1].lower().lstrip('.')
-    # Always read file content for hashing and deduplication
     await file.seek(0)
     file_content = await file.read()
     await file.seek(0)
-    # Run file hash calculation in thread pool
     loop = asyncio.get_event_loop()
     file_hash = await loop.run_in_executor(None, calculate_file_hash, file_content, file.filename, file.content_type, file_size)
-    # Deduplication check BEFORE upload
     existing = await files_collection.find_one({'file_hash': file_hash})
     deduplicate = False
     if existing:
-        existing_storage = StorageType(existing['storage_type'])
-        if (
-            (existing_storage == StorageType.STANDARD and folder_storage_type == StorageType.STANDARD) or
-            (existing_storage == StorageType.GLACIER_IR and folder_storage_type == StorageType.GLACIER_IR) or
-            (existing_storage == StorageType.DEEP_ARCHIVE and folder_storage_type == StorageType.DEEP_ARCHIVE)
-        ):
-            deduplicate = True
+        deduplicate = True
     public_token = folder.get("public_token")
     if deduplicate:
-        # Calculate billing size for deduplication case
-        thumbnail_size = 128 * 1024 if existing.get('thumbnail_s3_key') else 0
-        billing_size = calculate_total_billing_size(file_size, thumbnail_size)
-        
-        # Reuse S3 key and thumbnail, create new DB record
         file_in_db = FileInDB(
             filename=file.filename,
             original_filename=file.filename,
             file_type=file_type,
             content_type=file.content_type,
-            file_size=file_size,
-            billing_size=billing_size,
+            file_size=existing.get("file_size", calculate_total_billing_size(file_size,0)),
             folder_id=folder_id,
             owner_id=user_id,
             s3_key=existing['s3_key'],
@@ -195,22 +180,15 @@ async def upload_file(
                 {"_id": ObjectId(folder_id)},
                 {"$inc": {"file_count": 1}}
             )
-            # Track storage usage for deduplication case
-            if not deduplicate:  # Only track if it's not a duplicate
-                # Get thumbnail size from existing file
-                thumbnail_size = 0
-                if existing.get('thumbnail_s3_key'):
-                    # For deduplication, we need to estimate thumbnail size
-                    # Since we're reusing existing thumbnail, we'll use a default size
-                    thumbnail_size = 128 * 1024  # 128KB default for thumbnail
+
                 
-                await storage_tracking_service.update_user_storage_with_billing_size(
-                    user_id=user_id,
-                    file_size=file_size,
-                    thumbnail_size=thumbnail_size,
-                    storage_type=folder_storage_type,
-                    operation="upload"
-                )
+            existing_file_size = existing.get("file_size", apply_minimum_file_size(file_size))
+            await storage_tracking_service.update_user_storage(
+                user_id=user_id,
+                size_bytes=existing_file_size,
+                storage_type=folder_storage_type,
+                operation="upload"
+            )
             file_presigned_url = await s3_service.generate_presigned_url(existing['s3_key'], 3600)
             thumbnail_presigned_url = None
             if existing.get('thumbnail_s3_key'):
@@ -241,7 +219,7 @@ async def upload_file(
         and ((file_type == FileType.IMAGE and thumbnail_service.can_generate_thumbnail(file.content_type))
              or (file_type == FileType.VIDEO and thumbnail_service.can_generate_video_thumbnail(file.content_type)))
         and file_size <= 200 * 1024 * 1024):
-        pass  # file_content already read above
+        pass  
     else:
         file_content = None
     
@@ -250,7 +228,6 @@ async def upload_file(
     s3_url = await s3_service.upload_streaming_file(file, s3_key, folder_storage_type)
     
     # Calculate initial billing size (file only, thumbnail will be added later)
-    initial_billing_size = calculate_total_billing_size(file_size, 0)
     
     # Create file record first to get file ID
     file_in_db = FileInDB(
@@ -259,13 +236,12 @@ async def upload_file(
         file_type=file_type,
         content_type=file.content_type,
         file_size=file_size,
-        billing_size=initial_billing_size,
         folder_id=folder_id,
         owner_id=user_id,
         s3_key=s3_key,
-        s3_url="",  # Don't store static URLs
+        s3_url="",  
         thumbnail_s3_key=None,
-        thumbnail_s3_url="",  # Don't store static URLs
+        thumbnail_s3_url="",  
         storage_type=folder_storage_type,
         metadata={},
         file_hash=file_hash,
@@ -276,11 +252,11 @@ async def upload_file(
     result = await files_collection.insert_one(file_in_db.dict(by_alias=True))
     file_id = str(result.inserted_id)
     
-    # Track storage usage for new upload (file only, thumbnail will be tracked separately)
-    await storage_tracking_service.update_user_storage_with_billing_size(
+    # Track initial file storage (file only, thumbnail will be tracked separately)
+    initial_billing_size = apply_minimum_file_size(file_size)
+    await storage_tracking_service.update_user_storage(
         user_id=user_id,
-        file_size=file_size,
-        thumbnail_size=0,  # Thumbnail will be tracked when generated
+        size_bytes=initial_billing_size,
         storage_type=folder_storage_type,
         operation="upload"
     )
@@ -289,6 +265,7 @@ async def upload_file(
     thumbnail_s3_key = None
     calculated_faces = []
     calculated_unknown_faces = 0
+    total_file_billing_size = file_size
     if file_content and len(file_content) > 0:
         try:
             if file_type == FileType.IMAGE:
@@ -381,14 +358,18 @@ async def upload_file(
                     thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD
                 )
                 
-                # Track thumbnail storage usage (with minimum 128KB)
+                # Track thumbnail storage usage
                 thumbnail_size = thumbnail_stream.tell() if thumbnail_stream else 0
-                thumbnail_billing_size = apply_minimum_file_size(thumbnail_size)
+                total_file_billing_size = calculate_total_billing_size(file_size, thumbnail_size)
                 await storage_tracking_service.update_user_storage(
                     user_id=user_id,
-                    size_bytes=thumbnail_billing_size,
-                    storage_type=StorageType.STANDARD,
+                    size_bytes=thumbnail_size,  # Only track thumbnail size
+                    storage_type=StorageType.STANDARD,  # Thumbnails always use STANDARD storage
                     operation="upload"
+                )
+                await files_collection.update_one(
+                    {"_id": result.inserted_id},
+                    {"$set": {"file_size": total_file_billing_size}}
                 )
             
             
@@ -396,11 +377,12 @@ async def upload_file(
             print(f"❌ Thumbnail generation failed for {file.filename}: {str(e)}")
             import traceback
             traceback.print_exc()
+    
     elif file_type == FileType.VIDEO:
         metadata = {
             'format': file_extension,
             'content_type': file.content_type,
-            'size': file_size
+            'size': total_file_billing_size
         }
     
     # Update file record with thumbnail and face data
@@ -568,11 +550,10 @@ async def generate_and_upload_thumbnail(file_id: str, s3_key: str, filename: str
                     thumbnail_stream, thumbnail_s3_key, "image/webp", StorageType.STANDARD
                 )
                 
-                # Track thumbnail storage usage (with minimum 128KB)
-                await storage_tracking_service.update_user_storage_with_billing_size(
+                # Track thumbnail storage usage
+                await storage_tracking_service.update_user_storage(
                     user_id=user_id,
-                    file_size=0,  # No additional file size
-                    thumbnail_size=thumbnail_size,
+                    size_bytes=thumbnail_size,  # Only track thumbnail size
                     storage_type=StorageType.STANDARD,
                     operation="upload"
                 )
@@ -581,7 +562,7 @@ async def generate_and_upload_thumbnail(file_id: str, s3_key: str, filename: str
                 
                 update_data = {
                     "thumbnail_s3_key": thumbnail_s3_key,
-                    "billing_size": new_billing_size,
+                    "file_size": new_billing_size,
                     "metadata": metadata,
                     "face_references": calculated_faces
                 }
@@ -654,18 +635,13 @@ async def upload_complete(
             deduplicate = True
     public_token = folder.get("public_token")
     if deduplicate:
-        # Calculate billing size for deduplication case
-        thumbnail_size = 128 * 1024 if existing.get('thumbnail_s3_key') else 0
-        billing_size = calculate_total_billing_size(data.file_size, thumbnail_size)
-        
         # Reuse S3 key and thumbnail, create new DB record
         file_in_db = FileInDB(
             filename=data.filename,
             original_filename=data.filename,
             file_type=file_type,
             content_type=data.content_type,
-            file_size=data.file_size,
-            billing_size=billing_size,
+            file_size=existing.get("file_size", apply_minimum_file_size(data.file_size)),
             folder_id=data.folder_id,
             owner_id=user_id,
             s3_key=existing['s3_key'],
@@ -685,21 +661,13 @@ async def upload_complete(
                 {"$inc": {"file_count": 1}}
             )
             # Track storage usage for deduplication case
-            if not deduplicate:  # Only track if it's not a duplicate
-                # Get thumbnail size from existing file
-                thumbnail_size = 0
-                if existing.get('thumbnail_s3_key'):
-                    # For deduplication, we need to estimate thumbnail size
-                    # Since we're reusing existing thumbnail, we'll use a default size
-                    thumbnail_size = 128 * 1024  # 128KB default for thumbnail
-                
-                await storage_tracking_service.update_user_storage_with_billing_size(
-                    user_id=user_id,
-                    file_size=data.file_size,
-                    thumbnail_size=thumbnail_size,
-                    storage_type=storage_type,
-                    operation="upload"
-                )
+            existing_file_size = existing.get("file_size", apply_minimum_file_size(data.file_size))
+            await storage_tracking_service.update_user_storage(
+                user_id=user_id,
+                size_bytes=existing_file_size,
+                storage_type=storage_type,
+                operation="upload"
+            )
             file_presigned_url = await s3_service.generate_presigned_url(existing['s3_key'], 3600)
             thumbnail_presigned_url = None
             if existing.get('thumbnail_s3_key'):
@@ -711,7 +679,7 @@ async def upload_complete(
             return FileUploadResponse(
                 file_id=str(result.inserted_id),
                 filename=data.filename,
-                file_size=data.file_size,
+                file_size=existing.get("file_size", apply_minimum_file_size(data.file_size)),
                 file_type=file_type,
                 s3_url=file_presigned_url,
                 thumbnail_url=thumbnail_presigned_url,
@@ -720,17 +688,14 @@ async def upload_complete(
             )
         else:
             raise HTTPException(status_code=500, detail="Failed to save file record")
-    # Calculate initial billing size (file only, thumbnail will be added later)
-    initial_billing_size = calculate_total_billing_size(data.file_size, 0)
-    
     # 1. Create DB record with no thumbnail
+    initial_billing_size = apply_minimum_file_size(data.file_size)
     file_in_db = FileInDB(
         filename=data.filename,
         original_filename=data.filename,
         file_type=file_type,
         content_type=data.content_type,
-        file_size=data.file_size,
-        billing_size=initial_billing_size,
+        file_size=initial_billing_size,
         folder_id=data.folder_id,
         owner_id=user_id,
         s3_key=data.s3_key,
@@ -750,10 +715,9 @@ async def upload_complete(
             {"$inc": {"file_count": 1}}
         )
         # Track storage usage for new upload (file only, thumbnail will be tracked separately)
-        await storage_tracking_service.update_user_storage_with_billing_size(
+        await storage_tracking_service.update_user_storage(
             user_id=user_id,
-            file_size=data.file_size,
-            thumbnail_size=0,  # Thumbnail will be tracked when generated
+            size_bytes=initial_billing_size,
             storage_type=storage_type,
             operation="upload"
         )
@@ -772,7 +736,7 @@ async def upload_complete(
         return FileUploadResponse(
             file_id=str(result.inserted_id),
             filename=data.filename,
-            file_size=data.file_size,
+            file_size=initial_billing_size,
             file_type=file_type,
             s3_url=file_presigned_url,
             thumbnail_url=None,
@@ -1454,41 +1418,31 @@ async def delete_file(
     file_size = file_doc.get("file_size", 0)
     storage_type = StorageType(file_doc.get("storage_type", StorageType.GLACIER_IR))
     
-    # Use stored billing size if available, otherwise calculate it
-    if file_doc.get("billing_size"):
-        # Use the stored billing size directly
-        total_billing_size = file_doc["billing_size"]
-        await storage_tracking_service.update_user_storage(
-            user_id=user_id,
-            size_bytes=-total_billing_size,  # Negative for deletion
-            storage_type=storage_type,
-            operation="delete"
-        )
-        
-        # Also update the deleted storage tracking
-        if storage_type == StorageType.DEEP_ARCHIVE:
-            active_field = "storage_used_archived"
-            deleted_field = "storage_used_archived_deleted"
-        else:  # STANDARD
-            active_field = "storage_used_standard"
-            deleted_field = "storage_used_standard_deleted"
-        
-        users_collection = await get_users_collection()
-        await users_collection.update_one(
-            {"_id": user_id},
-            {
-                "$inc": {
-                    deleted_field: total_billing_size
-                }
+    # Use file_size directly since it now includes thumbnail size
+    await storage_tracking_service.update_user_storage(
+        user_id=user_id,
+        size_bytes=-file_size,  # Negative for deletion
+        storage_type=storage_type,
+        operation="delete"
+    )
+    
+    # Also update the deleted storage tracking
+    if storage_type == StorageType.DEEP_ARCHIVE:
+        active_field = "storage_used_archived"
+        deleted_field = "storage_used_archived_deleted"
+    else:  # STANDARD
+        active_field = "storage_used_standard"
+        deleted_field = "storage_used_standard_deleted"
+    
+    users_collection = await get_users_collection()
+    await users_collection.update_one(
+        {"_id": user_id},
+        {
+            "$inc": {
+                deleted_field: file_size
             }
-        )
-    else:
-        # Fallback to calculation if billing_size is not stored
-        thumbnail_size = 0
-        if file_doc.get("thumbnail_s3_key"):
-            thumbnail_size = 128 * 1024
-        
-        await storage_tracking_service.soft_delete_file(user_id, file_size, thumbnail_size, storage_type)
+        }
+    )
     
     # Update folder's file count
     await folders_collection.update_one(
@@ -1884,36 +1838,32 @@ async def restore_deleted_file(
     file_size = file_doc.get("file_size", 0)
     storage_type = StorageType(file_doc.get("storage_type", StorageType.GLACIER_IR))
     
-    # Use stored billing size if available, otherwise calculate it
-    if file_doc.get("billing_size"):
-        # Use the stored billing size directly
-        total_billing_size = file_doc["billing_size"]
-        
-        # Move storage from deleted back to active tracking
-        if storage_type == StorageType.DEEP_ARCHIVE:
-            active_field = "storage_used_archived"
-            deleted_field = "storage_used_archived_deleted"
-        else:  # STANDARD
-            active_field = "storage_used_standard"
-            deleted_field = "storage_used_standard_deleted"
-        
-        users_collection = await get_users_collection()
-        await users_collection.update_one(
-            {"_id": user_id},
-            {
-                "$inc": {
-                    deleted_field: -total_billing_size,     # Subtract from deleted
-                    active_field: total_billing_size        # Add back to active
-                }
+    # Use file_size directly since it now includes thumbnail size
+    await storage_tracking_service.update_user_storage(
+        user_id=user_id,
+        size_bytes=file_size,  # Positive for restoration
+        storage_type=storage_type,
+        operation="restore"
+    )
+    
+    # Move storage from deleted back to active tracking
+    if storage_type == StorageType.DEEP_ARCHIVE:
+        active_field = "storage_used_archived"
+        deleted_field = "storage_used_archived_deleted"
+    else:  # STANDARD
+        active_field = "storage_used_standard"
+        deleted_field = "storage_used_standard_deleted"
+    
+    users_collection = await get_users_collection()
+    await users_collection.update_one(
+        {"_id": user_id},
+        {
+            "$inc": {
+                deleted_field: -file_size,     # Subtract from deleted
+                active_field: file_size        # Add back to active
             }
-        )
-    else:
-        # Fallback to calculation if billing_size is not stored
-        thumbnail_size = 0
-        if file_doc.get("thumbnail_s3_key"):
-            thumbnail_size = 128 * 1024
-        
-        await storage_tracking_service.restore_deleted_file(user_id, file_size, thumbnail_size, storage_type)
+        }
+    )
     
     # Update folder's file count
     await folders_collection.update_one(
@@ -2012,32 +1962,15 @@ async def permanently_delete_file(
             detail="Failed to delete file from database"
         )
     
-    # Use stored billing size if available, otherwise calculate it
-    thumbnail_size = 0  # Initialize thumbnail_size
-    if file_doc.get("billing_size"):
-        total_billing_size = file_doc["billing_size"]
-        # For logging purposes, estimate thumbnail size from billing size
-        if file_doc.get("thumbnail_s3_key"):
-            thumbnail_size = total_billing_size - apply_minimum_file_size(file_size)
-            if thumbnail_size < 0:
-                thumbnail_size = 0
-    else:
-        # Calculate total billing size for permanent deletion
-        if file_doc.get("thumbnail_s3_key"):
-            # For permanent deletion, we need to estimate thumbnail size since we don't store it in the file record
-            # We'll use a default size of 128KB for thumbnails
-            thumbnail_size = 128 * 1024
-        
-        total_billing_size = calculate_total_billing_size(file_size, thumbnail_size)
-    
+    # Use file_size directly since it now includes thumbnail size
     # Update user storage tracking
     users_collection = await get_users_collection()
     await users_collection.update_one(
         {"_id": user_id},
-        {"$inc": {storage_field: -total_billing_size}}
+        {"$inc": {storage_field: -file_size}}
     )
     
-    print(f"📊 Storage tracking: Permanent delete - User {user_id}, {total_billing_size} bytes (file: {file_size}, thumbnail: {thumbnail_size}), {storage_type.value} -> removed from {storage_field}")
+    print(f"📊 Storage tracking: Permanent delete - User {user_id}, {file_size} bytes, {storage_type.value} -> removed from {storage_field}")
     
     # Update folder's file count only if file was not already soft-deleted
     if not file_doc.get("deleted", False):

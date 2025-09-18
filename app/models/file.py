@@ -47,7 +47,6 @@ class FileBase(BaseModel):
     file_type: FileType
     content_type: str
     file_size: int
-    billing_size: Optional[int] = None  # Total billing size including thumbnail
     folder_id: str
 
 
