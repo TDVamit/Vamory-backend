@@ -88,7 +88,7 @@ async def generate_cloudfront_signed_url(
     """
     # Get environment variables
     cdn_key_pair_id = os.getenv('CDN_KEY_GROUP_ID')  # This should be the Key Pair ID, not Key Group ID
-    cdn_domain_name = os.getenv('CDN_DOMAIN_NAME')
+    cdn_domain_name = 'd1fh10einhx93s.cloudfront.net'
     
     if not cdn_key_pair_id:
         raise ValueError("CDN_KEY_GROUP_ID environment variable not set (should contain the CloudFront Key Pair ID)")
