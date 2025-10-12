@@ -425,10 +425,10 @@ class CdnService:
                     m3u8_url_key = m3u8_url_key.split(".")[0]
                     m3u8_url_key = m3u8_url_key + ".m3u8"
                     m3u8_url_key = "HLS_Converted/" + m3u8_url_key
-                    m3u8_url = f"https://{self.cdn_domain}/{m3u8_url_key}"
+                    m3u8_url = f"https://d1fh10einhx93s.cloudfront.net/{m3u8_url_key}"
   
                 # Return unsigned URL - signed cookies will authorize access
-                unsigned_url = f"https://{self.cdn_domain}/{doc['s3_key']}"
+                unsigned_url = f"https://d1fh10einhx93s.cloudfront.net/{doc['s3_key']}"
                 
                 cdn_urls.append({
                     "id": str(doc["_id"]),
