@@ -36,6 +36,8 @@ dependencies = [
     "psutil>=7.0.0",
     "memory-profiler>=0.61.0",
     "aioboto3>=15.1.0",
+    "aiobotocore>=2.24.0",
+    "cryptography>=45.0.4",
 ]
 
 [tool.ruff]

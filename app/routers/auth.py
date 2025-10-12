@@ -206,11 +206,9 @@ async def upload_profile_pic(
         except Exception as e:
             print(f"Failed to delete old profile picture from S3: {str(e)}")
     
-    # Generate S3 key for profile picture in public logo folder
     unique_id = str(uuid.uuid4())
     s3_key = f"logo/{current_user.id}/{unique_id}.webp"
     
-    # Upload to S3 with STANDARD storage class (for fast access)
     try:
         s3_url = await s3_service.upload_file(
             file_content=processed_image,
@@ -222,19 +220,17 @@ async def upload_profile_pic(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload image to S3: {str(e)}")
     
-    # Generate public URL (lifetime access via bucket policy)
     public_url = f"https://vamory-s3-bucket-by-vamit.s3.{settings.aws_region}.amazonaws.com/{s3_key}"
     
-    # Update user in DB with both legacy base64 (for backward compatibility) and S3 data
     b64 = base64.b64encode(processed_image.getvalue()).decode('utf-8')
     b64_str = f"data:image/webp;base64,{b64}"
     
     await users_collection.update_one(
         {"_id": current_user.id}, 
         {"$set": {
-            "profile_pic": b64_str,  # Legacy base64 for backward compatibility
+            "profile_pic": b64_str,  
             "profile_pic_s3_key": s3_key,
-            "profile_pic_url": public_url  # Public URL with lifetime access
+            "profile_pic_url": public_url  
         }}
     )
     

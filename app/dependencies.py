@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.services.auth import get_current_user_id as get_user_id_from_token
 from app.database import get_users_collection, get_folders_collection, get_folder_access_collection
@@ -100,6 +100,16 @@ async def verify_public_token_func(token: str) -> dict:
 async def verify_public_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """FastAPI dependency to verify public token from query parameter"""
     return await verify_public_token_func(credentials.credentials)
+
+
+async def verify_secret_key(secret_key: str = Query(..., description="Secret key for CDN endpoints")) -> str:
+    """FastAPI dependency to verify secret key for CDN endpoints"""
+    if secret_key != settings.PUBLIC_SECRET_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid secret key"
+        )
+    return secret_key
 
 
 

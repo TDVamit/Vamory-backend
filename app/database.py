@@ -106,6 +106,46 @@ async def get_email_tracking_collection():
         return None
 
 
+async def get_hls_conversion_status_collection():
+    database = await get_database()
+    if database is None:
+        print("Warning: Database is None, cannot access hls_conversion_status collection")
+        return None
+    
+    # This will create the collection if it doesn't exist
+    collection = database.hls_conversion_status
+    
+    # Ensure the collection exists by trying to access it
+    try:
+        # This will create the collection if it doesn't exist
+        await collection.find_one({})
+        
+        # Create indexes for better performance
+        await collection.create_index([("job_id", 1)])
+        await collection.create_index([("status", 1)])
+        await collection.create_index([("created_at", -1)])
+        
+        return collection
+    except Exception as e:
+        print(f"Error accessing hls_conversion_status collection: {e}")
+        return None
+
+
+async def ensure_hls_conversion_status_collection():
+    """Ensure the hls_conversion_status collection exists with proper indexes"""
+    try:
+        collection = await get_hls_conversion_status_collection()
+        if collection is not None:
+            print("✓ HLS conversion status collection ready")
+            return True
+        else:
+            print("✗ Failed to create HLS conversion status collection")
+            return False
+    except Exception as e:
+        print(f"Error ensuring HLS conversion status collection: {e}")
+        return False
+
+
 async def ensure_email_tracking_collection():
     """Ensure the email_tracking collection exists with proper indexes"""
     try:
@@ -118,4 +158,44 @@ async def ensure_email_tracking_collection():
             return False
     except Exception as e:
         print(f"Error ensuring email tracking collection: {e}")
+        return False
+
+
+async def get_cdn_upload_status_collection():
+    database = await get_database()
+    if database is None:
+        print("Warning: Database is None, cannot access cdn_upload_status collection")
+        return None
+    
+    # This will create the collection if it doesn't exist
+    collection = database.cdn_upload_status
+    
+    # Ensure the collection exists by trying to access it
+    try:
+        # This will create the collection if it doesn't exist
+        await collection.find_one({})
+        
+        # Create indexes for better performance
+        await collection.create_index([("s3_key", 1)])
+        await collection.create_index([("status", 1)])
+        await collection.create_index([("created_at", -1)])
+        
+        return collection
+    except Exception as e:
+        print(f"Error accessing cdn_upload_status collection: {e}")
+        return None
+
+
+async def ensure_cdn_upload_status_collection():
+    """Ensure the cdn_upload_status collection exists with proper indexes"""
+    try:
+        collection = await get_cdn_upload_status_collection()
+        if collection is not None:
+            print("✓ CDN upload status collection ready")
+            return True
+        else:
+            print("✗ Failed to create CDN upload status collection")
+            return False
+    except Exception as e:
+        print(f"Error ensuring CDN upload status collection: {e}")
         return False 

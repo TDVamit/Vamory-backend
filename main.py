@@ -2,9 +2,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.database import connect_to_mongo, close_mongo_connection
-from app.routers import auth, folders, files, faces, ai_search, credit, notifications
+from app.routers import auth, folders, files, faces, ai_search, credit, notifications, cdn
 from app.config import settings
+from app.services.Hls_queue_listener import worker_loop
 import tflite_runtime.interpreter as tflite
+import asyncio
 import os
 
 
@@ -18,8 +20,21 @@ interpreter.allocate_tensors()
 async def lifespan(app: FastAPI):
     # Startup
     await connect_to_mongo()
+    
+    # Start HLS queue listener as background task
+    hls_task = asyncio.create_task(worker_loop())
+    print("✓ HLS queue listener started as background task")
+    
     yield
+    
     # Shutdown
+    # Cancel the HLS queue listener task
+    hls_task.cancel()
+    try:
+        await hls_task
+    except asyncio.CancelledError:
+        print("✓ HLS queue listener stopped")
+    
     await close_mongo_connection()
 
 
@@ -33,7 +48,7 @@ app = FastAPI(
 # CORS middleware with support for large file uploads
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://vamory.vadaevri.com","http://localhost:5173"],  # Configure this properly for production
+    allow_origins=["https://vamory.vadaevri.com","http://localhost:5173","http://127.0.0.1:5500","http://localhost:8002"],  # Configure this properly for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,6 +63,7 @@ app.include_router(faces.router, prefix="/api/v1")
 app.include_router(ai_search.router, prefix="/api/v1")
 app.include_router(credit.router, prefix="/api/v1")
 app.include_router(notifications.router, prefix="/api/v1")
+app.include_router(cdn.router, prefix="/api/v1")
 
 
 @app.get("/")

@@ -59,6 +59,14 @@ class Settings(BaseSettings):
     EMAIL_NAME:str
     SEND_DOMAIN:str
 
+    CDN_KEY_GROUP_ID:str
+    CDN_PRIVATE_KEY_PATH:str
+    CDN_DOMAIN_NAME:str
+    SQS_URL:str
+
+    PUBLIC_SECRET_KEY:str
+    redis_url:str
+
     @field_validator('allowed_image_extensions', 'allowed_video_extensions')
     @classmethod
     def parse_list_from_string(cls, v):
