@@ -45,6 +45,7 @@ class CdnUrlResponse(BaseModel):
     """Response model for CDN URL"""
     id: str = Field(..., description="Unique identifier")
     s3_key: str = Field(..., description="S3 key of the file")
+    s3_url: str = Field(..., description="S3 URL for the file")
     cdn_url: str = Field(..., description="CDN URL for the file")
     m3u8_url: Optional[str] = Field(default=None, description="M3U8 URL for the file")
     created_at: datetime = Field(..., description="When the record was created")

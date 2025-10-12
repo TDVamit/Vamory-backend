@@ -6,6 +6,7 @@ from app.config import settings
 from app.services.s3 import s3_service
 from app.database import get_cdn_upload_status_collection
 from app.models.cdn_models import CdnUploadStatus, CdnUploadStatusCreate, CdnUploadStatusUpdate
+from app.services.s3 import s3_service
 import logging
 import asyncio
 from cryptography.hazmat.primitives import hashes, serialization
@@ -429,9 +430,11 @@ class CdnService:
   
                 # Return unsigned URL - signed cookies will authorize access
                 signed_url = await self.generate_cdn_url(doc["s3_key"])
+                s3_url = await s3_service.generate_presigned_url(doc["s3_key"], 3600)
                 cdn_urls.append({
                     "id": str(doc["_id"]),
                     "s3_key": doc["s3_key"],
+                    "s3_url": s3_url,
                     "cdn_url": signed_url,
                     "m3u8_url": m3u8_url,
                     "created_at": doc["created_at"],
