@@ -62,7 +62,7 @@ async def set_signed_cookies(response: Response, expiration_hours: int = 1):
                 secure=True,  # Required for production HTTPS
                 httponly=True,  # Prevent JavaScript access for security
                 samesite="none",  # Required for cross-site 
-                cross_site_cookie_allowed=True
+                cross_site=True
             )
         
         logger.info(f"Set CloudFront signed cookies with {expiration_hours}h expiration")
