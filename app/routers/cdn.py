@@ -58,10 +58,11 @@ async def set_signed_cookies(response: Response, expiration_hours: int = 1):
                 max_age=max_age_seconds,
                 expires=expire_time,
                 path="/",
-                domain="*.vamory.vadaevri.com",  # Commented out - cookie will use the response domain
+                domain=".vamory.vadaevri.com",  # Commented out - cookie will use the response domain
                 secure=True,  # Required for production HTTPS
                 httponly=True,  # Prevent JavaScript access for security
-                samesite="none"  # Required for cross-site requests
+                samesite="none",  # Required for cross-site 
+                cross_site_cookie_allowed=True
             )
         
         logger.info(f"Set CloudFront signed cookies with {expiration_hours}h expiration")
