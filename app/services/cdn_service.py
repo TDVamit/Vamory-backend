@@ -100,7 +100,7 @@ async def generate_cloudfront_signed_url(
     private_key = await _load_private_key()
     
     # Construct the full URL
-    resource_url = f"https://{cdn_domain_name}/HLS_Converted/*"
+    resource_url = f"https://{cdn_domain_name}/{s3_key}"
     
     # Calculate expiration timestamp
     expiration_time = datetime.now(timezone.utc) + timedelta(hours=expiration_hours)
@@ -110,7 +110,7 @@ async def generate_cloudfront_signed_url(
     policy = {
         "Statement": [
             {
-                "Resource": resource_url,
+                "Resource": f"https://{cdn_domain_name}/HLS_Converted/*",
                 "Condition": {
                     "DateLessThan": {
                         "AWS:EpochTime": expiration_timestamp
