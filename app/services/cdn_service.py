@@ -436,7 +436,7 @@ class CdnService:
                     "s3_key": doc["s3_key"],
                     "s3_url": s3_url,
                     "cdn_url": signed_url,
-                    "m3u8_url": m3u8_url,
+                    "m3u8_url": signed_url,
                     "created_at": doc["created_at"],
                     "uploaded_at": doc.get("uploaded_at"),
                     "status": doc["status"]
