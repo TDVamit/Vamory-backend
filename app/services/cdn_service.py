@@ -100,7 +100,7 @@ async def generate_cloudfront_signed_url(
     private_key = await _load_private_key()
     
     # Construct the full URL
-    resource_url = f"https://{cdn_domain_name}/{s3_key}"
+    resource_url = f"https://{cdn_domain_name}/HLS_Converted/*"
     
     # Calculate expiration timestamp
     expiration_time = datetime.now(timezone.utc) + timedelta(hours=expiration_hours)
@@ -119,6 +119,7 @@ async def generate_cloudfront_signed_url(
             }
         ]
     }
+    
     
     # Convert policy to JSON string (no spaces)
     policy_json = json.dumps(policy, separators=(',', ':'))
@@ -434,7 +435,7 @@ class CdnService:
                 cdn_urls.append({
                     "id": str(doc["_id"]),
                     "s3_key": doc["s3_key"],
-                    "s3_url": s3_url,
+                    "s3_url": s3_url,       
                     "cdn_url": signed_url,
                     "m3u8_url": m3u8_url,
                     "created_at": doc["created_at"],
