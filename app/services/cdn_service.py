@@ -426,8 +426,8 @@ class CdnService:
                     m3u8_url_key = m3u8_url_key.split(".")[0]
                     m3u8_url_key = m3u8_url_key + ".m3u8"
                     m3u8_url_key = "HLS_Converted/" + m3u8_url_key
-                    m3u8_url = f"https://{self.cdn_domain}/{m3u8_url_key}"
-  
+                    # m3u8_url = f"https://{self.cdn_domain}/{m3u8_url_key}"
+                    m3u8_url = await self.generate_cdn_url(m3u8_url_key)
                 # Return unsigned URL - signed cookies will authorize access
                 signed_url = await self.generate_cdn_url(doc["s3_key"])
                 s3_url = await s3_service.generate_presigned_url(doc["s3_key"], 3600)
@@ -436,7 +436,7 @@ class CdnService:
                     "s3_key": doc["s3_key"],
                     "s3_url": s3_url,
                     "cdn_url": signed_url,
-                    "m3u8_url": signed_url,
+                    "m3u8_url": m3u8_url,
                     "created_at": doc["created_at"],
                     "uploaded_at": doc.get("uploaded_at"),
                     "status": doc["status"]
