@@ -190,7 +190,7 @@ async def generate_cloudfront_signed_cookies(
     
     # Construct the resource URL for the policy
     # Using wildcard to allow access to all resources under the domain
-    resource_url = f"https://d1fh10einhx93s.cloudfront.net/{resource_path}"
+    resource_url = f"https://vamory.vadaevri.com/{resource_path}"
     
     # Calculate expiration timestamp
     expiration_time = datetime.now(timezone.utc) + timedelta(hours=expiration_hours)
