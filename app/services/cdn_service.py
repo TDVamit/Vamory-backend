@@ -157,27 +157,7 @@ async def generate_cloudfront_signed_cookies(
     expiration_hours: int = 1,
     resource_path: str = "*"
 ) -> Dict[str, str]:
-    """
-    Generate CloudFront signed cookies for accessing private content.
-    
-    Args:
-        expiration_hours: Cookie expiration time in hours (default: 1)
-        resource_path: Path pattern to allow access to (default: "*" for all resources)
-    
-    Returns:
-        Dictionary with cookie names and values:
-        {
-            "CloudFront-Policy": "<encoded_policy>",
-            "CloudFront-Signature": "<signature>",
-            "CloudFront-Key-Pair-Id": "<key_pair_id>"
-        }
-    
-    Environment Variables Required:
-        CDN_KEY_GROUP_ID: CloudFront Key Pair ID
-        CDN_PRIVATE_KEY_PATH: Path to the private key PEM file
-        CDN_DOMAIN_NAME: CloudFront distribution domain name
-    """
-    # Get environment variables
+
     cdn_key_pair_id = os.getenv('CDN_KEY_GROUP_ID')
     cdn_domain_name = os.getenv('CDN_DOMAIN_NAME')
     
@@ -191,7 +171,7 @@ async def generate_cloudfront_signed_cookies(
     
     # Construct the resource URL for the policy
     # Using wildcard to allow access to all resources under the domain
-    resource_url = f"https://{cdn_domain_name}/{resource_path}"
+    resource_url = f"https://{cdn_domain_name}/*"
     
     # Calculate expiration timestamp
     expiration_time = datetime.now(timezone.utc) + timedelta(hours=expiration_hours)
